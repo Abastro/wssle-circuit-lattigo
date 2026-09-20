@@ -25,27 +25,46 @@ import (
 	"github.com/tuneinsight/lattigo/v6/ring"
 )
 
-// Ring/modulus sizing, matching the HIENAA reference parameters: a 104-bit
-// modulus budget at N=2^12, reported there as meeting 128-bit security per
-// the lattice-estimator (commit 14a3625), sized for 16-bit commitments and a
-// total weight of up to 2^12.
+// Ring/modulus sizing for 32-bit commitments and a total weight of up to
+// 2^11, with headroom for the noise flooding that threshold decryption needs.
 //
-// Unlike the CKKS variant of the same circuit, no multiplicative level chain
-// is needed: the external product consumes no levels, so a single ciphertext
-// prime suffices regardless of how many parties fold into [Aggregate].
+// N=2^13 admits roughly a 208-bit Q*P budget at 128-bit security. The
+// correctness requirement is
+//
+//	log Q >= 1 + log h + log(2*beta) + lambda + log sigma
+//
+// (see references/error-analysis): 1 bit for the centred lift, 32 for the
+// commitment, log(2*beta)+log sigma ~= 30 for a 6-sigma bound on the decryption
+// noise, and lambda=40 for smudging. That is 103 bits of Q, leaving 105 for P.
+//
+// P >= Q keeps the gadget at a single digit (dnum=1), which is both the fastest
+// and the quietest geometry: shrinking P to buy Q budget costs a one-time ~5
+// bits of noise and multiplies the per-external-product cost by dnum.
+//
+// Unlike the CKKS variant of the same circuit, no multiplicative level chain is
+// needed: the external product consumes no levels, so the modulus is sized
+// purely by the noise budget, not by how many parties fold into [Aggregate].
 const (
-	logN          = 12
+	logN          = 13
 	hammingWeight = 256
-	logQ          = 50
-	logP          = 54
-	logDelta      = 20
+	logDelta      = 24
 	sigma         = 3.2
+)
+
+// Q and P, split into NTT-friendly primes. dnum = ceil(len(logQ)/len(logP)) = 1.
+var (
+	logQ = []int{52, 51} // 103 bits
+	logP = []int{53, 52} // 105 bits
 )
 
 // CircuitParams holds the ring parameters and packing layout for the circuit.
 type CircuitParams struct {
-	RLWE    rlwe.Parameters
-	Delta   uint64 // fixed-point scaling factor applied to commitments.
+	RLWE rlwe.Parameters
+	// Delta is the scaling factor applied to commitments. It is not a free
+	// knob: correct rounding needs Delta*W > 2*beta*sigma, where sigma is the
+	// noise at the constant coefficient after [Elect]. logDelta=24 puts
+	// Delta*W at 2^35 against a measured requirement of 2^30.
+	Delta   uint64
 	Stride  int    // S = N/W, the packing stride: Y = X^S generates the subring.
 	TotalWt uint64 // W, the public total weight.
 }
@@ -60,8 +79,8 @@ func SetupParams(totalWeight uint64) CircuitParams {
 
 	params, err := rlwe.NewParametersFromLiteral(rlwe.ParametersLiteral{
 		LogN:    logN,
-		LogQ:    []int{logQ},
-		LogP:    []int{logP},
+		LogQ:    logQ,
+		LogP:    logP,
 		Xs:      ring.Ternary{H: hammingWeight},
 		Xe:      ring.DiscreteGaussian{Sigma: sigma, Bound: 6 * sigma},
 		NTTFlag: true,

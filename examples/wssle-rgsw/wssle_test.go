@@ -77,12 +77,14 @@ func testWSSLE(t *testing.T, parties []Party) {
 	t.Logf("elected commitment: %d (r_total=%d, W=%d)", result, want.r, totalWeight)
 }
 
-// uniformParties builds n weight-1 parties with distinct commitments, so the
-// total weight is n and every party owns exactly one slot.
+// uniformParties builds n weight-1 parties with distinct 32-bit commitments,
+// so the total weight is n and every party owns exactly one slot. The
+// commitments are full-width to exercise the modulus budget the parameters are
+// sized for (see [SetupParams]).
 func uniformParties(n int) []Party {
 	parties := make([]Party, n)
 	for i := range parties {
-		parties[i] = Party{Weight: 1, Commitment: uint64(250 + i)}
+		parties[i] = Party{Weight: 1, Commitment: uint64(0xFFFFFFFF - i)}
 	}
 	return parties
 }
