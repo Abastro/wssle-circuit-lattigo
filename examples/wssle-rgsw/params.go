@@ -61,12 +61,21 @@ var (
 type CircuitParams struct {
 	RLWE rlwe.Parameters
 	// Delta is the scaling factor applied to commitments. It is not a free
-	// knob: correct rounding needs Delta*W > 2*beta*sigma, where sigma is the
-	// noise at the constant coefficient after [Elect]. logDelta=24 puts
-	// Delta*W at 2^35 against a measured requirement of 2^30.
+	// knob: correct rounding needs [CircuitParams.ResultScale] to exceed
+	// 2*beta*sigma, where sigma is the noise at the constant coefficient after
+	// [Elect]. logDelta=24 puts it at 2^36 against a measured requirement of
+	// 2^30 under the pre-derivation encoding.
 	Delta   uint64
 	Stride  int    // S = N/W, the packing stride: Y = X^S generates the subring.
 	TotalWt uint64 // W, the public total weight.
+}
+
+// ResultScale is the factor [Elect]'s output carries on the elected
+// commitment: Delta from the encoding, W from the trace, and 2 from the
+// 2/(Y-1) of [deriveEncoder]. All three are divided out in the clear, which is
+// exact and free -- the election result is public.
+func (p CircuitParams) ResultScale() uint64 {
+	return 2 * p.Delta * p.TotalWt
 }
 
 // SetupParams builds [CircuitParams] for an election with the given public

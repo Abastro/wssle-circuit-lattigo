@@ -34,6 +34,38 @@ func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta uint64) *rlwe.P
 	return pt
 }
 
+// EncodeMonomial builds the plaintext Y^exp = X^{Stride*exp}, for any
+// 0 <= exp <= W. It carries no scaling factor: the monomials of this circuit
+// are all RGSW operands.
+//
+// exp == W is the one case that wraps: Y^W = X^N = -1, which lands on the
+// constant coefficient with a sign flip rather than off the end of the ring.
+// That is a party holding the entire stake, which [Register] must not reject.
+func EncodeMonomial(params CircuitParams, exp uint64) *rlwe.Plaintext {
+	pt := rlwe.NewPlaintext(params.RLWE, params.RLWE.MaxLevelQ())
+
+	ringQ := params.RLWE.RingQ().AtLevel(pt.Level())
+
+	idx, negated := params.Stride*int(exp), false
+	if idx >= ringQ.N() {
+		idx, negated = idx-ringQ.N(), true
+	}
+
+	for j, s := range ringQ.SubRings {
+		if negated {
+			pt.Value.Coeffs[j][idx] = s.Modulus - 1
+		} else {
+			pt.Value.Coeffs[j][idx] = 1
+		}
+	}
+
+	ringQ.NTT(pt.Value, pt.Value)
+	pt.IsNTT = true
+	pt.IsMontgomery = false
+
+	return pt
+}
+
 // DecodeCoeffs is the inverse of [EncodeCoeffs]: it centre-lifts the
 // plaintext's coefficients and divides them by divisor, returning the raw
 // (unrounded) values so callers can report the noise magnitude.

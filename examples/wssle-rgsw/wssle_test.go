@@ -47,9 +47,10 @@ func testWSSLE(t *testing.T, parties []Party) {
 	dec := rlwe.NewDecryptor(params.RLWE, sk)
 	eval := rgsw.NewEvaluator(params.RLWE, evk)
 
+	weights := EncryptWeights(enc, params, parties)
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
-	agg := Aggregate(eval, Identity(enc.Encryptor, params), regs)
+	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
 	ctOut := Elect(eval, agg, totalWeight)
 
 	pt := dec.DecryptNew(ctOut) // stand-in for ThFHE.Dec(ct_out, I)
@@ -61,7 +62,7 @@ func testWSSLE(t *testing.T, parties []Party) {
 	// Fig. 1 line 16's h* <- W^-1 |h'| (matched by DecodeResult).
 	wantCommitment := uint64(math.Round(math.Abs(want.h[0])))
 
-	decoded := DecodeCoeffs(params.RLWE, pt, params.Delta*params.TotalWt)
+	decoded := DecodeCoeffs(params.RLWE, pt, params.ResultScale())
 
 	wantVec := make([]float64, params.RLWE.N())
 	wantVec[0] = want.h[0]

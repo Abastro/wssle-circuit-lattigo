@@ -33,7 +33,7 @@ func Elect(eval *rgsw.Evaluator, agg *rlwe.Ciphertext, totalWeight uint64) *rlwe
 // coefficient can come back negated by the ring's negacyclic wraparound, when
 // the accumulated random shift carries it past Y^W = -1.
 func DecodeResult(params CircuitParams, pt *rlwe.Plaintext) uint64 {
-	for _, v := range DecodeCoeffs(params.RLWE, pt, params.Delta*params.TotalWt) {
+	for _, v := range DecodeCoeffs(params.RLWE, pt, params.ResultScale()) {
 		if r := math.Round(v); r != 0 {
 			return uint64(math.Abs(r))
 		}

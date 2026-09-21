@@ -48,6 +48,10 @@ func benchmarkWSSLE(b *testing.B, n int) {
 	eval := rgsw.NewEvaluator(params.RLWE, evk)
 	seed := Identity(enc.Encryptor, params)
 
+	// Stake is a public parameter, encrypted once per weight update rather
+	// than per election, so it sits outside the measured path.
+	weights := EncryptWeights(enc, params, parties)
+
 	// The other n-1 parties register on their own machines; prepare their
 	// registrations once, outside the timer, so only party 0's single
 	// Register is on the measured latency path.
@@ -65,7 +69,7 @@ func benchmarkWSSLE(b *testing.B, n int) {
 		registerTime += time.Since(start)
 
 		start = time.Now()
-		agg := Aggregate(eval, seed, regs)
+		agg := Aggregate(eval, seed, weights, regs)
 		aggregateTime += time.Since(start)
 
 		start = time.Now()
