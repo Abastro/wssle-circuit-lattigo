@@ -67,15 +67,50 @@ func EncodeMonomial(params CircuitParams, exp uint64) *rlwe.Plaintext {
 }
 
 // DecodeCoeffs is the inverse of [EncodeCoeffs]: it centre-lifts the
-// plaintext's coefficients and divides them by divisor, returning the raw
-// (unrounded) values so callers can report the noise magnitude.
+// plaintext's coefficients and divides them by divisor.
 //
-// divisor is delta for an ordinary plaintext, and delta*W for [Elect]'s
-// output, whose coefficients carry the trace's factor of W (Fig. 1, line 16:
-// h* <- W^-1 |h'|). Undoing W here rather than homomorphically is exact and
-// free: the election result is public, so the division happens in the clear
-// on an integer.
-func DecodeCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, divisor uint64) []float64 {
+// divisor is [CircuitParams.Scale] for an ordinary plaintext and
+// [CircuitParams.ResultScale] for [Elect]'s output, whose constant coefficient
+// carries the trace's factor of W (Fig. 1, line 16: h* <- W^-1 |h'|). Undoing
+// W here rather than homomorphically is exact and free: the election result is
+// public, so the division happens in the clear on an integer.
+//
+// The float64 result is exact enough to round a commitment off, but not to
+// measure noise: once the scale is large the message dominates its own
+// coefficient, and a value near 2^94 has a float64 ulp of 2^42. Use
+// [Residuals] for that.
+func DecodeCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, divisor *big.Int) []float64 {
+	centered := centeredCoeffs(params, pt)
+
+	div := new(big.Float).SetInt(divisor)
+	out := make([]float64, len(centered))
+	for i, v := range centered {
+		out[i], _ = new(big.Float).Quo(new(big.Float).SetInt(v), div).Float64()
+	}
+	return out
+}
+
+// Residuals returns each coefficient's exact signed distance to the nearest
+// multiple of scale -- that is, the noise it carries -- in [-scale/2, scale/2).
+//
+// This is the measurement [DecodeCoeffs] cannot make: it never forms the
+// message and the noise as one float, so the constant coefficient, which the
+// trace amplifies by W and which therefore carries the largest noise in the
+// ciphertext, stays visible.
+func Residuals(params rlwe.Parameters, pt *rlwe.Plaintext, scale *big.Int) []*big.Int {
+	half := new(big.Int).Rsh(scale, 1)
+
+	out := centeredCoeffs(params, pt)
+	for _, v := range out {
+		v.Add(v, half)
+		v.Mod(v, scale) // Mod is Euclidean, so the result is non-negative
+		v.Sub(v, half)
+	}
+	return out
+}
+
+// centeredCoeffs lifts pt's coefficients to the centred range of Q.
+func centeredCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext) []*big.Int {
 	ringQ := params.RingQ().AtLevel(pt.Level())
 
 	p := ringQ.NewPoly()
@@ -90,13 +125,7 @@ func DecodeCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, divisor uint64) []
 		centered[i] = new(big.Int)
 	}
 	ringQ.PolyToBigintCentered(p, 1, centered)
-
-	div := new(big.Float).SetUint64(divisor)
-	out := make([]float64, len(centered))
-	for i, v := range centered {
-		out[i], _ = new(big.Float).Quo(new(big.Float).SetInt(v), div).Float64()
-	}
-	return out
+	return centered
 }
 
 // mulMod returns a*b mod q for any a, b < 2^64, via the 128-bit product, so

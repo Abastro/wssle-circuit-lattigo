@@ -10,40 +10,67 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
+// paramSet is one row of the paper's parameter table
+// (benchmarks/09-three-parameter-sets.txt).
+type paramSet struct {
+	name       string
+	logN       int
+	logQ, logP []int
+	logDelta   int
+	W          uint64
+}
+
+var paramSets = []paramSet{
+	{"A", 14, []int{50, 50, 50, 50}, []int{54, 54, 54, 54}, 56, 1 << 14},
+	{"B", 13, []int{33, 33, 33, 32}, []int{39, 39}, 53, 1 << 12},
+	{"C", 13, []int{49, 49}, []int{56, 55}, 52, 1 << 11},
+}
+
 // BenchmarkWSSLE measures one party's latency across a range of election
-// sizes (16 .. 2048 weight-1 parties), mirroring the HIENAA reference
-// benchmark so the two libraries can be compared phase by phase.
+// sizes (16 .. 2048 parties) for each parameter set, mirroring the HIENAA
+// reference benchmark so the phases can be compared.
+//
+// The total weight is the parameter set's W, not n: each of the n parties
+// holds W/n, so the packing, the trace depth and the modulus are those of the
+// set, and only the party count varies.
 //
 // Register is per-party work that each party runs on its own machine, so from
 // any one party's point of view the latency is a single Register, not n of
-// them: the other n-1 registrations are prepared once outside the timer.
+// them: the other n-1 registrations are prepared once outside the timer, as are
+// the weight ciphertexts, which are public parameters reused across elections.
 // The aggregator-side pipeline (Aggregate over all n registrations, Elect,
 // Decrypt) is work a party waits on but does not perform, and is reported as
-// separate per-phase metrics. SetupParams/SetupKeys run once up front,
-// standing in for a ThFHE.Setup that a real deployment reuses across
-// elections. Single-thread pinned so the breakdown reflects sequential cost.
+// separate per-phase metrics. Key generation runs once up front, standing in
+// for a ThFHE.Setup that a real deployment reuses across elections.
+// Single-thread pinned so the breakdown reflects sequential cost.
+//
+// Commitments are the 32-bit values of [uniformParties] for every set; the
+// commitment value does not affect the cost of any phase.
 func BenchmarkWSSLE(b *testing.B) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 
-	for _, n := range []int{16, 64, 256, 1024, 2048} {
-		b.Run(strconv.Itoa(n)+" parties", func(b *testing.B) {
-			benchmarkWSSLE(b, n)
+	for _, ps := range paramSets {
+		b.Run(ps.name, func(b *testing.B) {
+			params := NewCircuitParams(ps.logN, ps.logQ, ps.logP, ps.logDelta, ps.W)
+			for _, n := range []int{16, 64, 256, 1024, 2048} {
+				b.Run(strconv.Itoa(n)+"_parties", func(b *testing.B) {
+					benchmarkWSSLE(b, params, n)
+				})
+			}
 		})
 	}
 }
 
-func benchmarkWSSLE(b *testing.B, n int) {
+func benchmarkWSSLE(b *testing.B, params CircuitParams, n int) {
 	parties := uniformParties(n)
-
-	var totalWeight uint64
-	for _, p := range parties {
-		totalWeight += p.Weight
+	for i := range parties {
+		parties[i].Weight = params.TotalWt / uint64(n)
 	}
+	totalWeight := params.TotalWt
 
-	params := SetupParams(totalWeight)
-	sk, evk := SetupKeys(params)
+	sk, pk, evk := SetupKeys(params)
 
-	enc := rgsw.NewEncryptor(params.RLWE, sk)
+	enc := rgsw.NewEncryptor(params.RLWE, pk)
 	dec := rlwe.NewDecryptor(params.RLWE, sk)
 	eval := rgsw.NewEvaluator(params.RLWE, evk)
 	seed := Identity(enc.Encryptor, params)

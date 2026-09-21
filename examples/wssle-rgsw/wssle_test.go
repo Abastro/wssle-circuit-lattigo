@@ -41,9 +41,9 @@ func testWSSLE(t *testing.T, parties []Party) {
 	}
 
 	params := SetupParams(totalWeight)
-	sk, evk := SetupKeys(params)
+	sk, pk, evk := SetupKeys(params)
 
-	enc := rgsw.NewEncryptor(params.RLWE, sk)
+	enc := rgsw.NewEncryptor(params.RLWE, pk)
 	dec := rlwe.NewDecryptor(params.RLWE, sk)
 	eval := rgsw.NewEvaluator(params.RLWE, evk)
 
@@ -67,6 +67,15 @@ func testWSSLE(t *testing.T, parties []Party) {
 	wantVec := make([]float64, params.RLWE.N())
 	wantVec[0] = want.h[0]
 	assertVec(t, "ctOut", decoded, wantVec)
+
+	// The exact noise, which assertVec cannot see: at the shipped scale the
+	// constant coefficient is ~2^94 and its float64 ulp is ~2^42, so the float
+	// view resolves noise only where the message is absent. Coefficient 0 is
+	// the one the trace amplifies by W, so it is the one that matters.
+	res := Residuals(params.RLWE, pt, params.ResultScale())
+	t.Logf("ctOut noise: coeff[0] = 2^%.2f, max over the rest = 2^%.2f",
+		log2Abs(res[0]), log2Abs(maxAbs(res[1:])))
+	reportFlooding(t, params, res)
 
 	got := math.Abs(decoded[0])
 	t.Logf("commitment precision = %.1f bits (got %v, want %v)",
