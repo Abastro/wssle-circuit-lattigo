@@ -11,9 +11,8 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
-// BenchmarkWSSLE measures one party's latency across a range of election
-// sizes (16 .. 2048 parties) for each parameter set, mirroring the HIENAA
-// reference benchmark so the phases can be compared.
+// BenchmarkWSSLE measures one party's latency across election sizes of
+// 2, 4, 8, .., 2048 parties for each parameter set, the sweep Relect reports.
 //
 // The total weight is the parameter set's W, not n: each of the n parties
 // holds W/n, so the packing, the trace depth and the modulus are those of the
@@ -31,6 +30,10 @@ import (
 // deployment reuses across elections.
 // Single-thread pinned so the breakdown reflects sequential cost.
 //
+// All of that untimed setup is built once per (set, n) and cached: Go calls a
+// benchmark function twice, a b.N = 1 calibration run and then the requested
+// count, and at n = 2048 the setup costs minutes.
+//
 // Commitments are the 32-bit values of [uniformParties] for every set; the
 // commitment value does not affect the cost of any phase.
 func BenchmarkWSSLE(b *testing.B) {
@@ -39,16 +42,39 @@ func BenchmarkWSSLE(b *testing.B) {
 	for _, ps := range ParamSets {
 		b.Run(ps.Name, func(b *testing.B) {
 			params := ps.Params()
-			for _, n := range []int{16, 64, 256, 1024, 2048} {
+			for n := 2; n <= 2048; n *= 2 {
 				b.Run(strconv.Itoa(n)+"_parties", func(b *testing.B) {
-					benchmarkWSSLE(b, params, n)
+					benchmarkWSSLE(b, ps.Name, params, n)
 				})
 			}
 		})
 	}
 }
 
-func benchmarkWSSLE(b *testing.B, params CircuitParams, n int) {
+// benchSetup is everything outside the timer for one (set, n).
+type benchSetup struct {
+	parties []Party
+	enc     *rgsw.Encryptor
+	eval    *rgsw.Evaluator
+	seed    *rlwe.Ciphertext
+	weights []*Weight
+	regs    []*Registration
+}
+
+// benchCache holds the setup of the (set, n) being measured, and only that one:
+// set A's at n = 2048 is tens of gigabytes.
+var benchCache struct {
+	key   string
+	setup *benchSetup
+}
+
+func setupFor(name string, params CircuitParams, n int) *benchSetup {
+	key := name + "/" + strconv.Itoa(n)
+	if benchCache.key == key {
+		return benchCache.setup
+	}
+	benchCache.key, benchCache.setup = "", nil // release the previous one first
+
 	parties := uniformParties(n)
 	for i := range parties {
 		parties[i].Weight = params.TotalWt / uint64(n)
@@ -56,20 +82,29 @@ func benchmarkWSSLE(b *testing.B, params CircuitParams, n int) {
 	_, pk, evk := SetupKeys(params)
 
 	enc := rgsw.NewEncryptor(params.RLWE, pk)
-	eval := rgsw.NewEvaluator(params.RLWE, evk)
-	seed := Identity(enc.Encryptor, params)
-
-	// Stake is a public parameter, encrypted once per weight update rather
-	// than per election, so it sits outside the measured path.
-	weights := EncryptWeights(enc, params, parties)
-
-	// The other n-1 parties register on their own machines; prepare their
-	// registrations once, outside the timer, so only party 0's single
-	// Register is on the measured latency path.
-	regs := make([]*Registration, len(parties))
-	for j := 1; j < len(parties); j++ {
-		regs[j] = Register(enc, params, parties[j])
+	st := &benchSetup{
+		parties: parties,
+		enc:     enc,
+		eval:    rgsw.NewEvaluator(params.RLWE, evk),
+		seed:    Identity(enc.Encryptor, params),
+		// Stake is a public parameter, encrypted once per weight update rather
+		// than per election, so it sits outside the measured path.
+		weights: EncryptWeights(enc, params, parties),
+		regs:    make([]*Registration, n),
 	}
+	// The other n-1 parties register on their own machines; only party 0's
+	// single Register is on the measured latency path.
+	for j := 1; j < n; j++ {
+		st.regs[j] = Register(enc, params, parties[j])
+	}
+
+	benchCache.key, benchCache.setup = key, st
+	return st
+}
+
+func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
+	st := setupFor(name, params, n)
+	enc, eval, seed, weights, regs, parties := st.enc, st.eval, st.seed, st.weights, st.regs, st.parties
 
 	var registerTime, aggregateTime, electTime time.Duration
 

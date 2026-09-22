@@ -58,6 +58,33 @@ func TestWSSLE(t *testing.T) {
 	}
 }
 
+// TestWSSLESweep runs the elections the benchmark times: every parameter set
+// at n = 2, 4, .., 2048 parties sharing the set's W equally, plus n = 1, a
+// single party holding the whole stake -- the one case where [EncodeMonomial]
+// wraps Y^W to -1. Each (set, n) runs sweepTrials elections, all in parallel
+// within a set; each is checked exactly as in TestWSSLE, and logs the sign the
+// winner's fragments came back with, so the negacyclic wraparound is on record.
+func TestWSSLESweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("full elections over the whole benchmark grid; skipped in -short mode")
+	}
+	const sweepTrials = 3
+	for _, ps := range ParamSets {
+		t.Run(ps.Name, func(t *testing.T) {
+			params := ps.Params()
+			for n := 1; n <= 2048; n *= 2 {
+				for trial := range sweepTrials {
+					name := strconv.Itoa(n) + "_parties/trial" + strconv.Itoa(trial)
+					t.Run(name, func(t *testing.T) {
+						t.Parallel()
+						testWSSLE(t, params, topParties(n, params.CommitmentBits(), ps.TotalWeight))
+					})
+				}
+			}
+		})
+	}
+}
+
 func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	sk, pk, evk := SetupKeys(params)
 
@@ -122,8 +149,8 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	res := Residuals(params.RLWE, pt, scale)
 	eFrag := log2Abs(maxAbs(res[:params.Fragments]))
 	eTotal := log2Abs(maxAbs(residualsOf(phases, scale)))
-	t.Logf("elected party %d of %d: eval error 2^%.2f (margin %.1f bits), with flooding 2^%.2f (margin %.1f bits)",
-		winner, len(parties), eFrag, halfBits-eFrag, eTotal, halfBits-eTotal)
+	t.Logf("elected party %d of %d (weight %d, sign %+d): eval error 2^%.2f (margin %.1f bits), with flooding 2^%.2f (margin %.1f bits)",
+		winner, len(parties), parties[winner].Weight, sign, eFrag, halfBits-eFrag, eTotal, halfBits-eTotal)
 }
 
 // residualsOf is each value's signed distance to the nearest multiple of scale.
