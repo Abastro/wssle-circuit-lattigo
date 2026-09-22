@@ -69,14 +69,28 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
 	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
-	pt := dec.DecryptNew(Elect(eval, params, agg)) // stand-in for ThFHE.Dec(ct_out, I)
+	ctOut := Elect(eval, params, agg)
 
 	winner := predictWinner(t, params, leaves)
 	want := parties[winner].Commitment
 
-	// Every coefficient, exactly: the winner's fragments at X^0 .. X^(C-1),
-	// sharing one sign (the negacyclic wraparound of Fig. 1 line 16,
-	// h* <- |h'|), and zero everywhere the traces have annihilated.
+	// The election result, as the committee decrypts it: every member's
+	// flooded share of the C output coefficients, combined and rounded.
+	keyShares := ShareSecretKey(params, sk)
+	shares := make([]DecryptionShare, len(keyShares))
+	for j, ks := range keyShares {
+		shares[j] = PartialDecrypt(params, ctOut, ks)
+	}
+	phases := CombineShares(params, ctOut, shares)
+	if got := DecodeFragments(params, phases); got.Cmp(want) != 0 {
+		t.Errorf("committee decrypted %v, want %v (party %d)", got, want, winner)
+	}
+
+	// Under the whole key, which only the test holds: every coefficient,
+	// exactly -- the winner's fragments at X^0 .. X^(C-1), sharing one sign
+	// (the negacyclic wraparound of Fig. 1 line 16, h* <- |h'|), and zero
+	// everywhere the traces have annihilated, so nothing else is revealed.
+	pt := dec.DecryptNew(ctOut)
 	rounded := RoundCoeffs(params.RLWE, pt, params.ResultScale())
 	sign := 0
 	for k, f := range SplitCommitment(params, want) {
@@ -100,12 +114,28 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 		t.Errorf("DecodeResult = %v, want %v (party %d)", got, want, winner)
 	}
 
-	// The noise is exact too. The margin is how far the largest fragment error
-	// sits below the S/2 that rounding tolerates.
-	res := Residuals(params.RLWE, pt, params.ResultScale())
+	// The errors are exact too: the evaluation error alone, under the whole
+	// key, and with the committee's flooding on top, each against the S/2 that
+	// rounding tolerates.
+	scale := params.ResultScale()
+	halfBits := float64(scale.BitLen() - 2)
+	res := Residuals(params.RLWE, pt, scale)
 	eFrag := log2Abs(maxAbs(res[:params.Fragments]))
-	t.Logf("elected party %d of %d: max fragment error 2^%.2f, max over the rest 2^%.2f, S/2 margin %.1f bits",
-		winner, len(parties), eFrag, log2Abs(maxAbs(res[params.Fragments:])), float64(params.ResultScale().BitLen()-2)-eFrag)
+	eTotal := log2Abs(maxAbs(residualsOf(phases, scale)))
+	t.Logf("elected party %d of %d: eval error 2^%.2f (margin %.1f bits), with flooding 2^%.2f (margin %.1f bits)",
+		winner, len(parties), eFrag, halfBits-eFrag, eTotal, halfBits-eTotal)
+}
+
+// residualsOf is each value's signed distance to the nearest multiple of scale.
+func residualsOf(vs []*big.Int, scale *big.Int) []*big.Int {
+	half := new(big.Int).Rsh(scale, 1)
+	out := make([]*big.Int, len(vs))
+	for i, v := range vs {
+		r := new(big.Int).Add(v, half)
+		r.Mod(r, scale)
+		out[i] = r.Sub(r, half)
+	}
+	return out
 }
 
 // predictWinner runs the plain-Go reference of [Aggregate] on the same weights

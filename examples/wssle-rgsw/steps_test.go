@@ -139,6 +139,67 @@ func TestTrace(t *testing.T) {
 	assertVec(t, "N^-1 * trace", DecodeCoeffs(params.RLWE, dec.DecryptNew(traced), params.Scale()), want)
 }
 
+// TestThresholdDecrypt checks the committee's decryption against decryption
+// under the whole key, which no one holds in an election and the test does:
+// the combined phase must be the true phase plus the committee's flooding,
+// that flooding within its hard bound 2m*F, and actually applied at scale F.
+func TestThresholdDecrypt(t *testing.T) {
+	params := SetupParams(8)
+	sk, pk, _ := SetupKeys(params)
+	keyShares := ShareSecretKey(params, sk)
+
+	ringQ := params.RLWE.RingQ()
+	sum := ringQ.NewPoly()
+	for _, ks := range keyShares {
+		ringQ.Add(sum, ks.Value, sum)
+	}
+	if !sum.Equal(&sk.Value.Q) {
+		t.Fatal("key shares do not sum to the key")
+	}
+
+	// A full-width commitment's fragments, at the scale Elect's output carries.
+	want := topCommitment(params.CommitmentBits())
+	coeffs := make([]uint64, params.RLWE.N())
+	for k, f := range SplitCommitment(params, want) {
+		coeffs[k] = f.Uint64()
+	}
+	ct, err := rlwe.NewEncryptor(params.RLWE, pk).EncryptNew(EncodeCoeffs(params.RLWE, coeffs, params.ResultScale()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shares := make([]DecryptionShare, params.CommitteeSize)
+	for j, ks := range keyShares {
+		shares[j] = PartialDecrypt(params, ct, ks)
+	}
+	phases := CombineShares(params, ct, shares)
+
+	if got := DecodeFragments(params, phases); got.Cmp(want) != 0 {
+		t.Errorf("DecodeFragments = %v, want %v", got, want)
+	}
+
+	truth := centeredCoeffs(params.RLWE, rlwe.NewDecryptor(params.RLWE, sk).DecryptNew(ct))
+	F := params.FloodBound()
+	bound := new(big.Int).Mul(F, big.NewInt(int64(2*params.CommitteeSize)))
+	largest := new(big.Int)
+	for k, ph := range phases {
+		flood := new(big.Int).Sub(ph, truth[k])
+		if new(big.Int).Abs(flood).Cmp(bound) > 0 {
+			t.Errorf("coeff %d: flooding 2^%.2f exceeds its bound 2m*F = 2^%.2f", k, log2Abs(flood), log2Abs(bound))
+		}
+		if new(big.Int).Abs(flood).Cmp(largest) > 0 {
+			largest.Abs(flood)
+		}
+	}
+	// A sum of 2m uniforms on [-F, F] has standard deviation F*sqrt(2m/3); all
+	// C of them below F/4 would mean the flooding is not being applied.
+	if largest.Cmp(new(big.Int).Rsh(F, 2)) < 0 {
+		t.Errorf("flooding too small: largest 2^%.2f, F = 2^%.2f", log2Abs(largest), log2Abs(F))
+	}
+	t.Logf("flooding: largest 2^%.2f, F = 2^%d, bound 2m*F = 2^%.2f",
+		log2Abs(largest), params.LogErrorBound+params.SmudgeBits(), log2Abs(bound))
+}
+
 // registerAll registers every party and, by decrypting each ct_R, recovers
 // the randomness it sampled so the plain-Go reference model can predict the
 // same outcome.

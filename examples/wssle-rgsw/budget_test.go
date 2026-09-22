@@ -9,36 +9,15 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
-// Statistical parameters of the threshold decryption, settled together:
-//
-//	statBits  per-uniform smudging exponent. The flooding each committee
-//	          member adds is the sum of TWO uniforms on [-2^statBits*B,
-//	          2^statBits*B], which by Dahl et al. (WAHC'23, eprint 2023/815)
-//	          gives statistical distance 2^(-2*statBits) rather than the
-//	          2^(-statBits) a single uniform would give.
-//	failBits  target decryption failure probability, 2^-failBits. The tail
-//	          parameter beta solving N*erfc(beta/sqrt2) = 2^-failBits is derived
-//	          per set by betaForFailure, since the union bound of
-//	          prop:err-dec runs over the ring's N coefficients.
-//
-// Committee members each contribute two uniforms, so the flooding sum has the
-// hard bound 2*|K| * 2^statBits * B = 2^(statBits + 1 + log2|K|) * B. Nothing
-// about it is probabilistic: uniform smudging has bounded support, so the only
-// event that can fail decryption is |e_eval| > B.
-const (
-	statBits      = 32
-	committeeSize = 32
-	failBits      = 64
-)
-
-// betaForFailure returns the beta with N*erfc(beta/sqrt2) = 2^-failBits, the
-// tail parameter of prop:err-dec in references/error-analysis.
-func betaForFailure(N int) float64 {
-	target := math.Exp2(-failBits)
+// betaForFailure returns the beta with n*erfc(beta/sqrt2) = 2^-statSecurity,
+// the tail parameter of prop:err-dec in references/error-analysis. The union
+// bound runs over the C coefficients the committee decrypts.
+func betaForFailure(n int) float64 {
+	target := math.Exp2(-statSecurity)
 	lo, hi := 1.0, 30.0
 	for i := 0; i < 200; i++ {
 		mid := (lo + hi) / 2
-		if float64(N)*math.Erfc(mid/math.Sqrt2) > target {
+		if float64(n)*math.Erfc(mid/math.Sqrt2) > target {
 			lo = mid
 		} else {
 			hi = mid
@@ -47,40 +26,47 @@ func betaForFailure(N int) float64 {
 	return (lo + hi) / 2
 }
 
-// TestFloodingBudget derives sigma_0 for each parameter set from the measured
-// primitives and checks the one sizing rule that threshold decryption imposes:
+// TestFloodingBudget checks each parameter set's threshold decryption against
+// the noise it has to carry:
 //
-//	(2 * |K| * 2^statBits + 1) * B  <=  scale/2,   B = beta * sigma_0
+//   - the stored error bound B = 2^LogErrorBound covers beta*sigma_0, with
+//     sigma_0 derived afresh from the measured primitives, so the evaluation
+//     error exceeds B only with probability 2^-64;
+//   - the committee's flooding and B fit below S/2 (FloodingFits, exact);
+//   - no fragment wraps Q (MaxFragment, exact).
 //
-// The left side is a hard bound, so a set that clears it never fails on the
-// flooding; a set that does not clear it always fails.
+// The flooding bound is hard, so a set passing all three fails decryption only
+// in the 2^-64 event that the evaluation error exceeds B.
 func TestFloodingBudget(t *testing.T) {
 	for _, ps := range ParamSets {
 		t.Run(ps.Name, func(t *testing.T) { checkBudget(t, ps) })
 	}
 }
 
-// checkBudget applies both sides of the scale constraint to one parameter set:
-// the flooding budget from below, and the no-wrap ceiling from above.
 func checkBudget(t *testing.T, ps ParamSet) {
-	floodBits := statBits + 1 + int(math.Log2(committeeSize)) // 2*|K| uniforms
-
 	params := ps.Params()
 	sigma0 := measureSigmaZero(t, params)
 
-	beta := betaForFailure(params.RLWE.N())
-	B := beta * sigma0
-	// need = 2^floodBits * B + B, in bits
-	need := math.Log2(math.Exp2(float64(floodBits))*B+B) + 1 // +1: scale/2
-	have := float64(params.ResultScale().BitLen() - 1)       // log2(scale)
+	beta := betaForFailure(params.Fragments)
+	derived := math.Log2(beta * sigma0)
+	t.Logf("sigma_0 = 2^%.2f  beta = %.3f (2^-%d over C = %d)  beta*sigma_0 = 2^%.2f  stored B = 2^%d (%+.2f bits)",
+		math.Log2(sigma0), beta, statSecurity, params.Fragments, derived, ps.LogErrorBound, float64(ps.LogErrorBound)-derived)
+	if derived > float64(ps.LogErrorBound) {
+		t.Errorf("set %s: beta*sigma_0 = 2^%.2f exceeds the stored bound 2^%d", ps.Name, derived, ps.LogErrorBound)
+	}
 
-	t.Logf("sigma_0 = 2^%.2f   beta = %.3f (p_fail = 2^-%d over N = %d)   B = 2^%.2f",
-		math.Log2(sigma0), beta, failBits, params.RLWE.N(), math.Log2(B))
-	t.Logf("flooding hard bound = 2^%d * B = 2^%.2f", floodBits, float64(floodBits)+math.Log2(B))
-	t.Logf("scale needed >= 2^%.2f   have 2^%.0f   headroom %+.2f bits", need, have, have-need)
+	// Flooding: 2m uniforms on [-F, F] plus B, against S/2.
+	m := params.CommitteeSize
+	lhs := new(big.Int).Mul(params.FloodBound(), big.NewInt(int64(2*m)))
+	lhs.Add(lhs, new(big.Int).Lsh(big.NewInt(1), uint(ps.LogErrorBound)))
+	half := new(big.Int).Rsh(params.ResultScale(), 1)
+	t.Logf("m = %d, s = %d, F = 2^%d: 2m*F + B = 2^%.2f against S/2 = 2^%.0f, headroom %+.2f bits",
+		m, params.SmudgeBits(), ps.LogErrorBound+params.SmudgeBits(), bitsOf(lhs), bitsOf(half), bitsOf(half)-bitsOf(lhs))
+	if !params.FloodingFits() {
+		t.Errorf("set %s: the committee's flooding does not fit below S/2", ps.Name)
+	}
 
-	// Upper bound: no fragment may wrap Q, which is what
-	// [CircuitParams.MaxFragment] bounds, exactly.
+	// Ceiling: no fragment may wrap Q.
 	top := topCommitment(ps.FragmentBits)
 	if top.Cmp(params.MaxFragment()) > 0 {
 		t.Errorf("set %s: %d-bit fragments wrap Q; MaxFragment has only %d bits",
@@ -88,10 +74,6 @@ func checkBudget(t *testing.T, ps ParamSet) {
 	} else {
 		t.Logf("ceiling ok: MaxFragment - (2^%d - 1) = 2^%.2f",
 			ps.FragmentBits, bitsOf(new(big.Int).Sub(params.MaxFragment(), top)))
-	}
-
-	if have < need {
-		t.Errorf("set %s: scale 2^%.0f is %.2f bits short of the flooding budget", ps.Name, have, need-have)
 	}
 }
 

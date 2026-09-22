@@ -21,6 +21,7 @@
 package wsslergsw
 
 import (
+	"math"
 	"math/big"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -34,13 +35,15 @@ import (
 //	from below   (2|K| 2^s + 1) * beta * sigma_0  <=  S/2
 //	from above   (2^H - 1) * S  +  S/2            <=  Q/2
 //
-// The lower bound is the flooding budget of threshold decryption. Each of the
-// |K| = 32 committee members adds a sum of two uniforms on [-2^s B, 2^s B] with
-// s = 32: that masks the evaluation error to statistical distance 2^-64 (Dahl
-// et al., WAHC'23, eprint 2023/815), and, having bounded support, bounds the
-// flooding outright. So the only event that can fail decryption is
-// |e_eval| > B = beta*sigma_0, which beta = 10.08 (10.15 at N = 2^14) makes a
-// 2^-64 event after a union bound over the N coefficients.
+// The lower bound is the flooding budget of threshold decryption (see
+// [PartialDecrypt]). Each of the |K| = 32 committee members adds, to each of
+// the C output coefficients it decrypts, a sum of two uniforms on
+// [-2^s B, 2^s B]: that masks the evaluation error to statistical distance
+// 2^(-2s) per coefficient (Dahl et al., WAHC'23, eprint 2023/815), so
+// s = ceil((64 + log2 C)/2) hides a whole share to 2^-64, and, having bounded
+// support, it bounds the flooding outright. So the only event that can fail
+// decryption is |e_eval| > B = beta*sigma_0, which beta = 9.16 to 9.30 makes a
+// 2^-64 event after a union bound over the C decrypted coefficients.
 //
 // sigma_0 is the noise at an output fragment. [Elect] extracts each fragment
 // with the full trace of the ring, pre-multiplied by N^-1 mod Q: the trace is an
@@ -80,6 +83,11 @@ import (
 const (
 	hammingWeight = 256
 	sigma         = 3.2
+
+	// statSecurity is the statistical distance, 2^-statSecurity, to which a
+	// decryption share hides the evaluation error; the same 64 bits bound the
+	// decryption failure probability through B (see [ParamSet.LogErrorBound]).
+	statSecurity = 64
 )
 
 // ParamSet is one row of the paper's parameter table.
@@ -94,24 +102,37 @@ type ParamSet struct {
 	// X^(S*j + k) of its slot j. Fragments must not exceed the stride S.
 	Fragments    int
 	FragmentBits uint
+
+	// CommitteeSize is m, the size of the key committee, which is separate from
+	// the parties and decrypts m-out-of-m.
+	CommitteeSize int
+	// LogErrorBound is log2 B, a bound on the evaluation error at an output
+	// fragment holding except with probability 2^-64: B >= beta*sigma_0 with
+	// C*erfc(beta/sqrt2) = 2^-64, sigma_0 as derived by TestFloodingBudget,
+	// rounded up to a power of two. It sizes the flooding.
+	LogErrorBound int
 }
 
-// The three parameter sets of the paper, all for 128-bit commitments.
+// The three parameter sets of the paper, all for 128-bit commitments and a
+// committee of 32.
 var (
 	ParamSetA = ParamSet{
 		Name: "A", LogN: 14,
 		LogQ: []int{50, 50, 50, 50}, LogP: []int{54, 54, 54, 54}, // 200 + 216, d = 1
 		LogDelta: 70, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
+		CommitteeSize: 32, LogErrorBound: 19, // B >= 9.155 * 2^15.42 = 2^18.61
 	}
 	ParamSetB = ParamSet{
 		Name: "B", LogN: 13,
 		LogQ: []int{33, 33, 33, 32}, LogP: []int{40, 39}, // 131 + 79, d = 2
 		LogDelta: 65, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
+		CommitteeSize: 32, LogErrorBound: 18, // B >= 9.230 * 2^14.43 = 2^17.64
 	}
 	ParamSetC = ParamSet{
 		Name: "C", LogN: 13,
 		LogQ: []int{49, 49}, LogP: []int{56, 55}, // 98 + 111, d = 1
 		LogDelta: 63, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
+		CommitteeSize: 32, LogErrorBound: 18, // B >= 9.304 * 2^14.43 = 2^17.65
 	}
 
 	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC}
@@ -140,14 +161,23 @@ func (ps ParamSet) Params() CircuitParams {
 		panic(err)
 	}
 
-	return CircuitParams{
-		RLWE:         params,
-		Delta:        new(big.Int).Lsh(big.NewInt(1), uint(ps.LogDelta)),
-		Stride:       N / int(W),
-		TotalWt:      W,
-		Fragments:    ps.Fragments,
-		FragmentBits: ps.FragmentBits,
+	cp := CircuitParams{
+		RLWE:          params,
+		Delta:         new(big.Int).Lsh(big.NewInt(1), uint(ps.LogDelta)),
+		Stride:        N / int(W),
+		TotalWt:       W,
+		Fragments:     ps.Fragments,
+		FragmentBits:  ps.FragmentBits,
+		CommitteeSize: ps.CommitteeSize,
+		LogErrorBound: ps.LogErrorBound,
 	}
+	if ps.CommitteeSize < 1 {
+		panic("the key committee needs at least one member")
+	}
+	if !cp.FloodingFits() {
+		panic("the flooding of a full committee does not fit the output scale")
+	}
+	return cp
 }
 
 // SetupParams builds [CircuitParams] on set C's ring, modulus and fragment
@@ -172,6 +202,9 @@ type CircuitParams struct {
 
 	Fragments    int  // C, the fragments per commitment
 	FragmentBits uint // H, the bits per fragment
+
+	CommitteeSize int // m, the key committee
+	LogErrorBound int // log2 B, see [ParamSet.LogErrorBound]
 }
 
 // CommitmentBits is the width of a commitment, C*H.
@@ -197,6 +230,34 @@ func (p CircuitParams) ResultScale() *big.Int {
 	return p.EncodedScale()
 }
 
+// SmudgeBits is s, the ratio 2^s of the flooding range to the error bound B.
+// A share reveals C coefficients, each hidden to statistical distance 2^(-2s)
+// by the two uniforms of [PartialDecrypt]; the share as a whole is then within
+// C * 2^(-2s) <= 2^-statSecurity.
+func (p CircuitParams) SmudgeBits() int {
+	return int(math.Ceil((statSecurity + math.Log2(float64(p.Fragments))) / 2))
+}
+
+// FloodBound is F = 2^s * B: each member floods each coefficient of its share
+// with the sum of two uniforms on [-F, F].
+func (p CircuitParams) FloodBound() *big.Int {
+	return new(big.Int).Lsh(big.NewInt(1), uint(p.LogErrorBound+p.SmudgeBits()))
+}
+
+// FloodingFits reports whether the whole committee's flooding, together with
+// the evaluation error, stays below the S/2 that rounding tolerates:
+//
+//	2m*F + B <= S/2.
+//
+// The left side is a hard bound -- uniforms have bounded support -- except for
+// B itself, which the evaluation error exceeds with probability 2^-64. So a
+// set passing this check fails decryption only in that event.
+func (p CircuitParams) FloodingFits() bool {
+	lhs := new(big.Int).Mul(p.FloodBound(), big.NewInt(int64(2*p.CommitteeSize)))
+	lhs.Add(lhs, new(big.Int).Lsh(big.NewInt(1), uint(p.LogErrorBound)))
+	return lhs.Cmp(new(big.Int).Rsh(p.ResultScale(), 1)) <= 0
+}
+
 // MaxFragment is the largest fragment [Elect]'s output can carry without
 // wrapping Q: the largest h with h*S + S/2 <= Q/2, S = [CircuitParams.ResultScale],
 // where S/2 is the most error the final rounding tolerates. The same bound
@@ -215,11 +276,10 @@ func (p CircuitParams) MaxFragment() *big.Int {
 // ciphertexts anywhere (see [Elect]), so Galois keys are the only evaluation
 // keys in play.
 //
-// The keys are generated centrally from a single secret key, standing in for
-// the key committee's DKG. Under a real N-out-of-N setup the same keys would
-// come from multiparty.GaloisKeyGenProtocol (or from a trusted dealer holding
-// the summed secret key); neither changes the shape or the cost of what the
-// circuit below evaluates.
+// This is the trusted dealer: it generates every key from one secret key, and
+// then hands the committee additive shares of that key ([ShareSecretKey]) and
+// erases it. The circuit only ever sees pk and the evaluation keys; decryption
+// goes through the shares.
 //
 // Registration must encrypt under pk, not sk: a party does not hold the secret
 // key. The distinction is not cosmetic for the noise. A secret-key RGSW
