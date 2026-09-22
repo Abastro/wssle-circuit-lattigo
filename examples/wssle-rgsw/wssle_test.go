@@ -2,6 +2,7 @@ package wsslergsw
 
 import (
 	"math"
+	"math/big"
 	"strconv"
 	"testing"
 
@@ -9,38 +10,55 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
+const (
+	electionTrials  = 10   // independent elections per parameter set
+	electionParties = 2048 // the largest election size benchmarked
+)
+
 // TestWSSLE runs the full circuit end-to-end and checks the elected
-// commitment against an independent prediction. [refAggregate] already bakes
-// in the randomness shift (mirroring [Aggregate]'s two-pass structure), so
-// the winning commitment is simply want.h[0] -- no separate slot
-// reconstruction is needed.
+// commitment exactly against an independent prediction.
+//
+// Each parameter set runs electionTrials elections, every one with fresh keys,
+// weight material, registrations and randomness. The commitments fill the top
+// of the H-bit range, so the no-wrap ceiling is exercised where it binds -- a
+// commitment above [CircuitParams.MaxCommitment] would make [Register] panic.
+//
+// No flooding is added: threshold decryption is out of scope here (a single
+// secret key stands in for the committee). The flooding only consumes budget,
+// deterministically, and TestFloodingBudget checks that budget.
 func TestWSSLE(t *testing.T) {
 	t.Run("5 parties", func(t *testing.T) {
-		testWSSLE(t, []Party{
-			{Weight: 1, Commitment: 250},
-			{Weight: 2, Commitment: 251},
-			{Weight: 1, Commitment: 252},
-			{Weight: 3, Commitment: 253},
-			{Weight: 1, Commitment: 254},
+		testWSSLE(t, SetupParams(8), []Party{
+			{Weight: 1, Commitment: big.NewInt(250)},
+			{Weight: 2, Commitment: big.NewInt(251)},
+			{Weight: 1, Commitment: big.NewInt(252)},
+			{Weight: 3, Commitment: big.NewInt(253)},
+			{Weight: 1, Commitment: big.NewInt(254)},
 		})
 	})
 
-	for _, n := range []int{16, 64, 1024, 2048} {
-		// 2048 weight-1 parties saturate the ring: W=2048 makes the stride
-		// S=N/W=2, the tightest packing logN=12 supports.
-		t.Run(strconv.Itoa(n)+" parties", func(t *testing.T) {
-			testWSSLE(t, uniformParties(n))
+	if testing.Short() {
+		t.Skip("full elections at n = 2048 on every parameter set; skipped in -short mode")
+	}
+	for _, ps := range ParamSets {
+		t.Run(ps.Name, func(t *testing.T) {
+			params := ps.Params()
+			if top := topCommitment(ps.CoeffBits); top.Cmp(params.MaxCommitment()) > 0 {
+				t.Fatalf("set %s cannot carry %d-bit commitments: MaxCommitment has %d bits",
+					ps.Name, ps.CoeffBits, params.MaxCommitment().BitLen())
+			}
+			for trial := range electionTrials {
+				// Sets run one after another; a set's trials run in parallel.
+				t.Run("trial"+strconv.Itoa(trial), func(t *testing.T) {
+					t.Parallel()
+					testWSSLE(t, params, topParties(electionParties, ps.CoeffBits, ps.TotalWeight))
+				})
+			}
 		})
 	}
 }
 
-func testWSSLE(t *testing.T, parties []Party) {
-	var totalWeight uint64
-	for _, p := range parties {
-		totalWeight += p.Weight
-	}
-
-	params := SetupParams(totalWeight)
+func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	sk, pk, evk := SetupKeys(params)
 
 	enc := rgsw.NewEncryptor(params.RLWE, pk)
@@ -51,50 +69,81 @@ func testWSSLE(t *testing.T, parties []Party) {
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
 	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
-	ctOut := Elect(eval, agg, totalWeight)
+	pt := dec.DecryptNew(Elect(eval, agg, params.TotalWt)) // stand-in for ThFHE.Dec(ct_out, I)
 
-	pt := dec.DecryptNew(ctOut) // stand-in for ThFHE.Dec(ct_out, I)
-	result := DecodeResult(params, pt)
+	winner := predictWinner(t, params, leaves)
+	want := parties[winner].Commitment
 
-	want := refAggregate(params.RLWE.N(), params.Stride, leaves)
-
-	// h* can come back negated by the ring's negacyclic wraparound, hence
-	// Fig. 1 line 16's h* <- W^-1 |h'| (matched by DecodeResult).
-	wantCommitment := uint64(math.Round(math.Abs(want.h[0])))
-
-	decoded := DecodeCoeffs(params.RLWE, pt, params.ResultScale())
-
-	wantVec := make([]float64, params.RLWE.N())
-	wantVec[0] = want.h[0]
-	assertVec(t, "ctOut", decoded, wantVec)
-
-	// The exact noise, which assertVec cannot see: at the shipped scale the
-	// constant coefficient is ~2^94 and its float64 ulp is ~2^42, so the float
-	// view resolves noise only where the message is absent. Coefficient 0 is
-	// the one the trace amplifies by W, so it is the one that matters.
-	res := Residuals(params.RLWE, pt, params.ResultScale())
-	t.Logf("ctOut noise: coeff[0] = 2^%.2f, max over the rest = 2^%.2f",
-		log2Abs(res[0]), log2Abs(maxAbs(res[1:])))
-	reportFlooding(t, params, res)
-
-	got := math.Abs(decoded[0])
-	t.Logf("commitment precision = %.1f bits (got %v, want %v)",
-		-math.Log2(math.Abs(got-float64(wantCommitment))), got, wantCommitment)
-
-	if result != wantCommitment {
-		t.Errorf("elected commitment = %d, want %d (r_total=%d, W=%d)", result, wantCommitment, want.r, totalWeight)
+	// Every coefficient, exactly: the winner at coefficient 0, up to the sign
+	// of the negacyclic wraparound (Fig. 1 line 16: h* <- W^-1 |h'|), and zero
+	// everywhere the trace has annihilated.
+	rounded := RoundCoeffs(params.RLWE, pt, params.ResultScale())
+	if got := new(big.Int).Abs(rounded[0]); got.Cmp(want) != 0 {
+		t.Errorf("coeff[0] = %v, want +-%v (party %d)", rounded[0], want, winner)
 	}
-	t.Logf("elected commitment: %d (r_total=%d, W=%d)", result, want.r, totalWeight)
+	for i, v := range rounded[1:] {
+		if v.Sign() != 0 {
+			t.Errorf("coeff[%d] = %v, want 0", i+1, v)
+		}
+	}
+	if got := DecodeResult(params, pt); got.Cmp(want) != 0 {
+		t.Errorf("DecodeResult = %v, want %v (party %d)", got, want, winner)
+	}
+
+	// The noise is exact too; coefficient 0 is the one the trace amplifies by
+	// W. The margin is how far it sits below the S/2 that rounding tolerates.
+	res := Residuals(params.RLWE, pt, params.ResultScale())
+	e0 := log2Abs(res[0])
+	t.Logf("elected party %d of %d: |e_0| = 2^%.2f, max over the rest 2^%.2f, S/2 margin %.1f bits",
+		winner, len(parties), e0, log2Abs(maxAbs(res[1:])), float64(params.ResultScale().BitLen()-2)-e0)
+}
+
+// predictWinner runs the plain-Go reference of [Aggregate] on the same weights
+// and randomness as the real run, with each party's commitment replaced by its
+// label i+1. The labels are small, so the float64 reference carries them
+// exactly, whatever the width of the real commitments; the trace keeps only
+// coefficient 0, so that is where the winner's label lands.
+func predictWinner(t *testing.T, params CircuitParams, leaves []refNode) int {
+	t.Helper()
+
+	rank, stride := params.RLWE.N(), params.Stride
+	labelled := make([]refNode, len(leaves))
+	for i, l := range leaves {
+		label := Party{Weight: l.w, Commitment: big.NewInt(int64(i + 1))}
+		labelled[i] = refNode{w: l.w, r: l.r, h: refHVec(rank, stride, label)}
+	}
+
+	h0 := math.Abs(refAggregate(rank, stride, labelled).h[0])
+	winner := int(h0) - 1
+	if float64(winner+1) != h0 || winner < 0 || winner >= len(leaves) {
+		t.Fatalf("reference put %v at coefficient 0, not a party label", h0)
+	}
+	return winner
+}
+
+// topParties builds n parties sharing the total weight equally, with distinct
+// commitments at the very top of the bits-wide range.
+func topParties(n int, bits uint, totalWeight uint64) []Party {
+	top := topCommitment(bits)
+	parties := make([]Party, n)
+	for i := range parties {
+		c := new(big.Int).Sub(top, big.NewInt(int64(i)))
+		parties[i] = Party{Weight: totalWeight / uint64(n), Commitment: c}
+	}
+	return parties
+}
+
+// topCommitment is 2^bits - 1, the largest bits-wide commitment.
+func topCommitment(bits uint) *big.Int {
+	return new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), bits), big.NewInt(1))
 }
 
 // uniformParties builds n weight-1 parties with distinct 32-bit commitments,
-// so the total weight is n and every party owns exactly one slot. The
-// commitments are full-width to exercise the modulus budget the parameters are
-// sized for (see [SetupParams]).
+// so the total weight is n and every party owns exactly one slot.
 func uniformParties(n int) []Party {
 	parties := make([]Party, n)
 	for i := range parties {
-		parties[i] = Party{Weight: 1, Commitment: uint64(0xFFFFFFFF - i)}
+		parties[i] = Party{Weight: 1, Commitment: big.NewInt(int64(0xFFFFFFFF - i))}
 	}
 	return parties
 }

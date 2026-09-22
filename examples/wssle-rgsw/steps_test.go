@@ -18,7 +18,7 @@ func TestRegister(t *testing.T) {
 	dec := rlwe.NewDecryptor(params.RLWE, sk)
 	eval := rgsw.NewEvaluator(params.RLWE, evk)
 
-	p := Party{Weight: 3, Commitment: 12} // 4-bit commitment, see TestAggregate
+	p := Party{Weight: 3, Commitment: big.NewInt(12)} // 4-bit commitment, see TestAggregate
 	weight := EncryptWeight(enc, params, p.Weight)
 	reg := Register(enc, params, p)
 
@@ -32,14 +32,14 @@ func TestRegister(t *testing.T) {
 	assertVec(t, "ctEcd", decryptRGSW(enc, dec, eval, params, weight.CtEcd), wantEcd)
 
 	// The registered commitment is the bare constant; the spread comes later.
-	assertOneHot(t, "ctH", DecodeCoeffs(params.RLWE, dec.DecryptNew(reg.CtH), params.Scale()), 0, float64(p.Commitment))
+	assertOneHot(t, "ctH", DecodeCoeffs(params.RLWE, dec.DecryptNew(reg.CtH), params.Scale()), 0, commitFloat(p.Commitment))
 
 	// Applying ctEcd reproduces Fig. 1 line 5's ct_H, doubled.
 	ctEcd := rlwe.NewCiphertext(params.RLWE, 1, reg.CtH.Level())
 	encodeH(eval, weight, reg, ctEcd)
 	wantH := make([]float64, params.RLWE.N())
 	for k := uint64(0); k < p.Weight; k++ {
-		wantH[params.Stride*int(k)] = float64(p.Commitment)
+		wantH[params.Stride*int(k)] = commitFloat(p.Commitment)
 	}
 	assertVec(t, "encodeH", DecodeCoeffs(params.RLWE, dec.DecryptNew(ctEcd), params.EncodedScale()), wantH)
 
@@ -61,11 +61,11 @@ func TestRegister(t *testing.T) {
 // computation ([refCombineEcd]/[refAggregate]).
 func TestAggregate(t *testing.T) {
 	parties := []Party{
-		{Weight: 1, Commitment: 9},
-		{Weight: 2, Commitment: 10},
-		{Weight: 1, Commitment: 11},
-		{Weight: 3, Commitment: 12},
-		{Weight: 1, Commitment: 13},
+		{Weight: 1, Commitment: big.NewInt(9)},
+		{Weight: 2, Commitment: big.NewInt(10)},
+		{Weight: 1, Commitment: big.NewInt(11)},
+		{Weight: 3, Commitment: big.NewInt(12)},
+		{Weight: 1, Commitment: big.NewInt(13)},
 	}
 
 	params := SetupParams(8)
@@ -159,7 +159,7 @@ type refNode struct {
 func refHVec(rank, stride int, p Party) []float64 {
 	h := make([]float64, rank)
 	for k := uint64(0); k < p.Weight; k++ {
-		h[stride*int(k)] = float64(p.Commitment)
+		h[stride*int(k)] = commitFloat(p.Commitment)
 	}
 	return h
 }
@@ -305,55 +305,10 @@ func log2Abs(v *big.Int) float64 {
 	return math.Log2(f)
 }
 
-// sigmaZero estimates the noise at the constant coefficient of [Elect]'s
-// output. The trace sums over W automorphisms: at coefficient 0 every image
-// lands on the same monomial and they add coherently, giving a factor W, while
-// at every other coefficient the images are spread and add incoherently, giving
-// sqrt(W). So sigma_0 = sqrt(W) * sigma_bulk -- and sigma_bulk can be estimated
-// to a fraction of a bit from the N-1 non-constant residuals, where coefficient
-// 0 on its own is a single sample.
-func sigmaZero(params CircuitParams, res []*big.Int) float64 {
-	sum := new(big.Float)
-	for _, v := range res[1:] {
-		f := new(big.Float).SetInt(v)
-		sum.Add(sum, f.Mul(f, f))
-	}
-	ms, _ := sum.Quo(sum, big.NewFloat(float64(len(res)-1))).Float64()
-	return math.Sqrt(ms * float64(params.TotalWt))
-}
-
-// reportFlooding derives, from the measured circuit noise, the smudging the
-// shipped modulus supports.
-//
-// No flooding is added anywhere in these tests: threshold decryption is out of
-// scope here (a single secret key stands in for the committee), so this is the
-// estimate the parameters are sized against, not a measurement of it.
-//
-// lambda is the per-scalar smudging ratio B/B_flood, as the literature quotes
-// it. An adversary seeing a whole decryption sees |gamma| ring elements, so the
-// end-to-end distance is larger by log2(N*|gamma|); sample-extracting ct_out to
-// an LWE ciphertext before PartDec removes the log2(N) of that.
-func reportFlooding(t *testing.T, params CircuitParams, res []*big.Int) {
-	t.Helper()
-
-	// tSec makes B a bound on the evaluation error holding except with
-	// probability 2^-41, which the smudging lemma needs and which is also the
-	// only way correctness fails once the flooding is uniform.
-	const tSec, tFail = 7.24, 6.12
-
-	logSigma0 := math.Log2(sigmaZero(params, res))
-	logB := math.Log2(tSec) + logSigma0
-
-	scale, _ := new(big.Float).SetInt(params.ResultScale()).Float64()
-	budget := scale / 2
-
-	// Uniform smudging on [-B_flood, B_flood] admits the whole budget, since it
-	// has a hard bound; a Gaussian must reserve tFail sigma for its tail and
-	// still accepts a 2^-30 failure rate for doing so.
-	uniform := math.Log2((budget - math.Exp2(logB)) / math.Exp2(logB))
-	gauss := math.Log2(budget) - math.Log2(tFail) - logB
-
-	t.Logf("sigma_0 = 2^%.2f -> B = 2^%.2f, budget = 2^%.0f: "+
-		"lambda %.2f uniform (fails only w.p. 2^-41), or %.2f Gaussian at failure 2^-30",
-		logSigma0, logB, math.Log2(budget), uniform, gauss)
+// commitFloat is a commitment as a float64, for the float reference model. It
+// is exact only below 2^53; the reference therefore runs on small commitments,
+// or on party labels (see predictWinner), never on full-width ones.
+func commitFloat(c *big.Int) float64 {
+	f, _ := new(big.Float).SetInt(c).Float64()
+	return f
 }

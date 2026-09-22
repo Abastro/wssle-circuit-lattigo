@@ -1,7 +1,7 @@
 package wsslergsw
 
 import (
-	"math"
+	"math/big"
 
 	"github.com/tuneinsight/lattigo/v6/core/rgsw"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -32,11 +32,14 @@ func Elect(eval *rgsw.Evaluator, agg *rlwe.Ciphertext, totalWeight uint64) *rlwe
 // The magnitude, per Fig. 1 line 16 (h* <- W^-1 |h'|): the winning
 // coefficient can come back negated by the ring's negacyclic wraparound, when
 // the accumulated random shift carries it past Y^W = -1.
-func DecodeResult(params CircuitParams, pt *rlwe.Plaintext) uint64 {
-	for _, v := range DecodeCoeffs(params.RLWE, pt, params.ResultScale()) {
-		if r := math.Round(v); r != 0 {
-			return uint64(math.Abs(r))
+//
+// The rounding is done in integers ([RoundCoeffs]): a commitment is wider than
+// float64's 53-bit mantissa in parameter sets A and B.
+func DecodeResult(params CircuitParams, pt *rlwe.Plaintext) *big.Int {
+	for _, q := range RoundCoeffs(params.RLWE, pt, params.ResultScale()) {
+		if q.Sign() != 0 {
+			return q.Abs(q)
 		}
 	}
-	return 0
+	return new(big.Int)
 }

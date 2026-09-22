@@ -10,12 +10,15 @@ import (
 // EncodeCoeffs builds a coefficient-encoded plaintext holding delta*coeffs,
 // in the NTT domain.
 //
-// This is the whole "encoder" this circuit needs. The scheme packages encode
+// With [EncodeMonomial] and [EncodeCommitment], this is all the encoding the
+// circuit needs. The scheme packages encode
 // through the canonical embedding (slots), whereas every value here lives in
 // a coefficient of the ring: a weight is the monomial X^{S*w}, a commitment
 // block is a run of equal coefficients at stride S. delta is 1 for the RGSW
 // operands -- an RGSW ciphertext encrypts a raw ring element used as a
-// multiplier, not a scaled message -- and [CircuitParams.Delta] for ct_H.
+// multiplier, not a scaled message -- and [CircuitParams.Delta] for a scaled
+// message. ct_H itself goes through [EncodeCommitment], since a commitment
+// need not fit a uint64.
 func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta uint64) *rlwe.Plaintext {
 	pt := rlwe.NewPlaintext(params, params.MaxLevelQ())
 
@@ -25,6 +28,28 @@ func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta uint64) *rlwe.P
 		for i, c := range coeffs {
 			dst[i] = mulMod(c, delta, q)
 		}
+	}
+
+	ringQ.NTT(pt.Value, pt.Value)
+	pt.IsNTT = true
+	pt.IsMontgomery = false
+
+	return pt
+}
+
+// EncodeCommitment builds the plaintext Delta*h, in the NTT domain: the
+// constant polynomial ct_H encrypts. h may be wider than a machine word, so
+// Delta*h is formed exactly and reduced into each RNS prime.
+func EncodeCommitment(params CircuitParams, h *big.Int) *rlwe.Plaintext {
+	pt := rlwe.NewPlaintext(params.RLWE, params.RLWE.MaxLevelQ())
+
+	v := new(big.Int).Mul(h, params.Scale())
+	qi, r := new(big.Int), new(big.Int)
+
+	ringQ := params.RLWE.RingQ().AtLevel(pt.Level())
+	for j, s := range ringQ.SubRings {
+		qi.SetUint64(s.Modulus)
+		pt.Value.Coeffs[j][0] = r.Mod(v, qi).Uint64()
 	}
 
 	ringQ.NTT(pt.Value, pt.Value)
@@ -75,8 +100,9 @@ func EncodeMonomial(params CircuitParams, exp uint64) *rlwe.Plaintext {
 // W here rather than homomorphically is exact and free: the election result is
 // public, so the division happens in the clear on an integer.
 //
-// The float64 result is exact enough to round a commitment off, but not to
-// measure noise: once the scale is large the message dominates its own
+// The float64 result is for inspection only. It cannot round off a commitment
+// wider than 53 bits -- [RoundCoeffs] does that, in integers -- nor measure
+// noise: once the scale is large the message dominates its own
 // coefficient, and a value near 2^94 has a float64 ulp of 2^42. Use
 // [Residuals] for that.
 func DecodeCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, divisor *big.Int) []float64 {
@@ -86,6 +112,22 @@ func DecodeCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, divisor *big.Int) 
 	out := make([]float64, len(centered))
 	for i, v := range centered {
 		out[i], _ = new(big.Float).Quo(new(big.Float).SetInt(v), div).Float64()
+	}
+	return out
+}
+
+// RoundCoeffs is the exact counterpart of [DecodeCoeffs]: each coefficient,
+// centre-lifted, divided by scale and rounded to the nearest integer, in
+// integer arithmetic throughout.
+func RoundCoeffs(params rlwe.Parameters, pt *rlwe.Plaintext, scale *big.Int) []*big.Int {
+	half := new(big.Int).Rsh(scale, 1)
+
+	out := centeredCoeffs(params, pt)
+	for _, v := range out {
+		// floor((v + scale/2) / scale): Div is Euclidean, hence a floor for
+		// the positive divisor, including when v is negative.
+		v.Add(v, half)
+		v.Div(v, scale)
 	}
 	return out
 }

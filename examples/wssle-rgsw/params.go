@@ -27,81 +27,101 @@ import (
 	"github.com/tuneinsight/lattigo/v6/ring"
 )
 
-// Ring/modulus sizing for 32-bit commitments, a total weight of up to 2^11,
-// and the noise flooding that threshold decryption needs, semi-honest.
+// Each parameter set is sized by two constraints on the scale S = 2*Delta*W
+// that [Elect]'s output carries, one from each side (references/error-analysis,
+// sec:dec):
 //
-// The budget comes from the lattice estimator (the full LWE.estimate, not the
-// rough one, which is hardcoded to usvp and dual_hybrid and so cannot even see
-// bdd_mitm_hybrid, the attack that binds here): at N=2^13 with this sparse
-// ternary secret, log(Q*P)=209 gives 128.5 bits, and each further bit costs
-// 0.57.
+//	from below   (2|K| 2^s + 1) * beta * sigma_0  <=  S/2
+//	from above   (2^H - 1) * S  +  S/2            <=  Q/2
 //
-// Within that budget everything is pinned by sigma_0, the noise at the constant
-// coefficient of [Elect]'s output. It is derived, not measured: one election is
-// a single sample of it, and the trace makes it sqrt(W) larger than the bulk it
-// would otherwise be read off. What is measured is the three primitives, where
-// one ciphertext carries N coefficients and so a handful of encryptions gives
-// thousands of samples (see TestNoiseModel):
+// The lower bound is the flooding budget of threshold decryption. Each of the
+// |K| = 32 committee members adds a sum of two uniforms on [-2^s B, 2^s B] with
+// s = 32: that masks the evaluation error to statistical distance 2^-64 (Dahl
+// et al., WAHC'23, eprint 2023/815), and, having bounded support, bounds the
+// flooding outright. So the only event that can fail decryption is
+// |e_eval| > B = beta*sigma_0, which beta = 10.08 (10.15 at N = 2^14) makes a
+// 2^-64 event after a union bound over the N coefficients.
 //
-//	sigma_rlwe       = 2^2.21   fresh RLWE under pk
-//	sigma_ext        = 2^2.23   one external product against an RGSW monomial
-//	sigma_ext_tilde  = 2^3.59   one against the derived encoder, which carries
-//	                            the ||2/(Y-1)||_2^2 = W amplification
+// sigma_0 is the noise at the constant coefficient, the one the trace
+// amplifies coherently. It is derived, not measured -- an election is a single
+// sample of it -- from the measured primitive variances sigma_rlwe, sigma_ext
+// and sigma_ext_tilde, each over a fresh key pair and a fresh RGSW operand per
+// sample (see TestFloodingBudget).
 //
-// The chain of references/error-analysis then gives
+// The upper bound keeps the elected commitment from wrapping Q. It caps S at
+// 2^floor(log2 Q - H - 1), with log2 Q the actual size of the prime product:
+// lattigo's primes land a little above or below their nominal sizes, which
+// moves the floor by one when log2 Q - H - 1 falls just short of an integer, as
+// it does for set C. [CircuitParams.MaxCommitment] reports the bound exactly.
 //
-//	sigma_ecd^2 <= (4W+1) sigma_rlwe^2 + n sigma_ext_tilde^2 + 2n sigma_ext^2
-//	sigma_0     <= W sqrt(sigma_ecd^2 + sigma_ext^2/3)         = 2^20.55
+// Lattice security is from the full LWE.estimate of the lattice estimator, not
+// the rough one, which runs only usvp and dual_hybrid and so misses
+// bdd_mitm_hybrid, the attack that binds for this sparse ternary secret:
 //
-// and with B = 7.24*sigma_0 bounding the evaluation error except w.p. 2^-41,
-// and scale = 2*Delta*W = 2^64 -- the largest that fits, which must be checked
-// exactly rather than as log2(Q) - 1 - log2(|h|_inf): Q falls 2^69.2 short of
-// 2^98, so 2^65 overflows Q/2 by 2^67.8 for a commitment at the top of its
-// range, while 2^64 clears it,
+//	set  log(QP)  security  sigma_0   flooding headroom
+//	A    416      128.0     2^24.8    +3.8 bits
+//	B    210      127.9     2^22.7    +1.0 bits
+//	C    209      128.5     2^20.8    +0.9 bits
 //
-//	lambda = 36.7,
-//
-// with the smudging noise uniform on [-B_flood, B_flood] rather than Gaussian.
-// The distinction is worth 2.6 bits here: a uniform smudge has a hard bound, so
-// B_flood can be the whole rounding budget and decryption fails only when the
-// circuit error exceeds B, i.e. with the same 2^-41 the security argument
-// already assumes. A Gaussian must reserve 6.12 sigma_flood for its tail and
-// still accepts a 2^-30 failure rate, which leaves only lambda = 38.0.
-//
-// sigma_rlwe is smaller than Definition 2 of the paper would give (2^6.18),
-// because lattigo encrypts over QP and rescales by P, leaving the rounding term
-// alone. That is a legitimate implementation choice, not an assumption of the
-// analysis; sized against Definition 2 instead, the same modulus would support
-// lambda = 34.8.
-//
-// Q=98 is the best split of the 209. Above it sigma_0 climbs as (Q/P)^2 through
-// sigma_ext_tilde; below it sigma_0 has already reached its floor of 2^20.12,
-// set by h alone, so a bit off Q is a bit of scale lost for nothing. lambda=40
-// is out of reach at this ring: it needs log(Q*P) = 215, costing 3.4 bits of
-// lattice security. N=2^14 clears it with room to spare.
+// Set B is the one whose split matters. With d = 2 the decomposition digit has
+// to stay well under P, while the ceiling wants Q large for its 64-bit
+// coefficients; at log(QP) = 209 the best split measured only +0.1 bits. One
+// more bit, on P, buys the +1.0.
 //
 // Unlike the CKKS variant of the same circuit, no multiplicative level chain is
 // needed: the external product consumes no levels, so the modulus is sized
 // purely by the noise budget, not by how many parties fold into [Aggregate].
 const (
-	logN          = 13
 	hammingWeight = 256
-	logDelta      = 52
 	sigma         = 3.2
 )
 
-// Q and P, split into NTT-friendly primes. dnum = ceil(len(logQ)/len(logP)) = 1.
+// ParamSet is one row of the paper's parameter table.
+type ParamSet struct {
+	Name        string
+	LogN        int
+	LogQ, LogP  []int // bit sizes of the Q and P primes; d = ceil(len(LogQ)/len(LogP))
+	LogDelta    int
+	TotalWeight uint64 // W
+	// CoeffBits is H, the bit size of the value one coefficient carries. The
+	// paper splits a commitment over C coefficients; this implementation
+	// places each commitment in a single coefficient, so its commitments are
+	// CoeffBits wide.
+	CoeffBits uint
+}
+
+// The three parameter sets of the paper.
 var (
-	logQ = []int{49, 49} // 98 bits
-	logP = []int{56, 55} // 111 bits
+	ParamSetA = ParamSet{
+		Name: "A", LogN: 14,
+		LogQ: []int{50, 50, 50, 50}, LogP: []int{54, 54, 54, 54}, // 200 + 216, d = 1
+		LogDelta: 56, TotalWeight: 1 << 14, CoeffBits: 128,
+	}
+	ParamSetB = ParamSet{
+		Name: "B", LogN: 13,
+		LogQ: []int{33, 33, 33, 32}, LogP: []int{40, 39}, // 131 + 79, d = 2
+		LogDelta: 53, TotalWeight: 1 << 12, CoeffBits: 64,
+	}
+	ParamSetC = ParamSet{
+		Name: "C", LogN: 13,
+		LogQ: []int{49, 49}, LogP: []int{56, 55}, // 98 + 111, d = 1
+		LogDelta: 52, TotalWeight: 1 << 11, CoeffBits: 32,
+	}
+
+	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC}
 )
+
+// Params builds the [CircuitParams] of the set.
+func (ps ParamSet) Params() CircuitParams {
+	return NewCircuitParams(ps.LogN, ps.LogQ, ps.LogP, ps.LogDelta, ps.TotalWeight)
+}
 
 // CircuitParams holds the ring parameters and packing layout for the circuit.
 type CircuitParams struct {
 	RLWE rlwe.Parameters
 	// Delta is the scaling factor applied to commitments. It is not a free
 	// knob: [CircuitParams.ResultScale] has to leave room for the flooding
-	// noise, which is what sizes it here (see the sizing note above).
+	// noise below and [CircuitParams.MaxCommitment] above (see [ParamSet]).
 	Delta   uint64
 	Stride  int    // S = N/W, the packing stride: Y = X^S generates the subring.
 	TotalWt uint64 // W, the public total weight.
@@ -124,21 +144,31 @@ func (p CircuitParams) EncodedScale() *big.Int {
 // election result is public.
 //
 // It is a [big.Int] because it does not fit a uint64: the flooding noise that
-// threshold decryption needs puts logDelta at 52, so the scale is 2^64.
+// threshold decryption needs takes it to 2^64 and beyond (2^71 for set A).
 func (p CircuitParams) ResultScale() *big.Int {
 	return new(big.Int).Mul(p.EncodedScale(), new(big.Int).SetUint64(p.TotalWt))
 }
 
-// SetupParams builds [CircuitParams] for an election with the given public
-// total weight, which must be a power of two dividing the ring degree, on the
-// shipped ring and modulus (parameter set C of the paper).
-func SetupParams(totalWeight uint64) CircuitParams {
-	return NewCircuitParams(logN, logQ, logP, logDelta, totalWeight)
+// MaxCommitment is the largest commitment [Elect]'s output can carry without
+// wrapping Q: the largest h with h*S + S/2 <= Q/2, S = [CircuitParams.ResultScale],
+// where S/2 is the most error the final rounding tolerates. [Register] rejects
+// anything larger.
+func (p CircuitParams) MaxCommitment() *big.Int {
+	scale := p.ResultScale()
+	h := new(big.Int).Rsh(p.RLWE.RingQ().Modulus(), 1) // floor(Q/2): Q is odd
+	h.Sub(h, new(big.Int).Rsh(scale, 1))
+	return h.Div(h, scale)
 }
 
-// NewCircuitParams builds [CircuitParams] on an explicit ring and modulus, for
-// the parameter sets other than the shipped one. The sizing argument above
-// applies to each; benchmarks/09-three-parameter-sets.txt records the three.
+// SetupParams builds [CircuitParams] on set C's ring and modulus for an
+// election of any other public total weight, which must be a power of two
+// dividing the ring degree. The step tests use it with small W.
+func SetupParams(totalWeight uint64) CircuitParams {
+	c := ParamSetC
+	return NewCircuitParams(c.LogN, c.LogQ, c.LogP, c.LogDelta, totalWeight)
+}
+
+// NewCircuitParams builds [CircuitParams] on an explicit ring and modulus.
 func NewCircuitParams(logN int, logQ, logP []int, logDelta int, totalWeight uint64) CircuitParams {
 	N := 1 << logN
 	if totalWeight == 0 || N%int(totalWeight) != 0 {

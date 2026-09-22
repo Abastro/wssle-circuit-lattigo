@@ -1,6 +1,8 @@
 package wsslergsw
 
 import (
+	"math/big"
+
 	"github.com/tuneinsight/lattigo/v6/core/rgsw"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/utils/sampling"
@@ -8,13 +10,14 @@ import (
 
 // Party is one participant's private input: its stake weight and its
 // leader-commitment value. Commitment stands in for H(x_i) of the protocol --
-// kept a plain integer here, since the circuit only ever moves it around.
+// a plain non-negative integer, since the circuit only ever moves it around,
+// but a [big.Int], since the parameter sets carry up to 128 bits of it.
 //
 // Only Commitment is registered per election; Weight goes through
 // [EncryptWeight] once, as a public parameter.
 type Party struct {
 	Weight     uint64
-	Commitment uint64
+	Commitment *big.Int
 }
 
 // Registration is the pair a party publishes in the Registration phase:
@@ -34,14 +37,19 @@ type Registration struct {
 // Register runs the Registration phase for a single party: RLWE-encrypts the
 // commitment and RGSW-encrypts a fresh randomness monomial Y^r for r sampled
 // uniformly from Z_W.
+//
+// It rejects a commitment above [CircuitParams.MaxCommitment]: the circuit
+// would carry it faithfully until the last step, where it wraps Q and decodes
+// to a different value.
 func Register(enc *rgsw.Encryptor, params CircuitParams, p Party) *Registration {
+	if p.Commitment.Sign() < 0 || p.Commitment.Cmp(params.MaxCommitment()) > 0 {
+		panic("commitment outside [0, MaxCommitment]")
+	}
+
 	// W is a power of two, so this reduction is unbiased.
 	r := sampling.RandUint64() % params.TotalWt
 
-	hCoeffs := make([]uint64, params.RLWE.N())
-	hCoeffs[0] = p.Commitment
-
-	ctH, err := enc.EncryptNew(EncodeCoeffs(params.RLWE, hCoeffs, params.Delta))
+	ctH, err := enc.EncryptNew(EncodeCommitment(params, p.Commitment))
 	if err != nil {
 		panic(err)
 	}

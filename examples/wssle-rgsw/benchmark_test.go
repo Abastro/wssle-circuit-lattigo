@@ -10,22 +10,6 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
-// paramSet is one row of the paper's parameter table
-// (benchmarks/09-three-parameter-sets.txt).
-type paramSet struct {
-	name       string
-	logN       int
-	logQ, logP []int
-	logDelta   int
-	W          uint64
-}
-
-var paramSets = []paramSet{
-	{"A", 14, []int{50, 50, 50, 50}, []int{54, 54, 54, 54}, 56, 1 << 14},
-	{"B", 13, []int{33, 33, 33, 32}, []int{39, 39}, 53, 1 << 12},
-	{"C", 13, []int{49, 49}, []int{56, 55}, 52, 1 << 11},
-}
-
 // BenchmarkWSSLE measures one party's latency across a range of election
 // sizes (16 .. 2048 parties) for each parameter set, mirroring the HIENAA
 // reference benchmark so the phases can be compared.
@@ -49,9 +33,9 @@ var paramSets = []paramSet{
 func BenchmarkWSSLE(b *testing.B) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 
-	for _, ps := range paramSets {
-		b.Run(ps.name, func(b *testing.B) {
-			params := NewCircuitParams(ps.logN, ps.logQ, ps.logP, ps.logDelta, ps.W)
+	for _, ps := range ParamSets {
+		b.Run(ps.Name, func(b *testing.B) {
+			params := ps.Params()
 			for _, n := range []int{16, 64, 256, 1024, 2048} {
 				b.Run(strconv.Itoa(n)+"_parties", func(b *testing.B) {
 					benchmarkWSSLE(b, params, n)
