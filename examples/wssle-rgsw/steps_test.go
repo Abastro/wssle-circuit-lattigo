@@ -3,6 +3,7 @@ package wsslergsw
 import (
 	"math"
 	"math/big"
+	"math/bits"
 	"math/rand"
 	"testing"
 
@@ -32,16 +33,16 @@ func TestRegister(t *testing.T) {
 	}
 	assertVec(t, "ctEcd", decryptRGSW(enc, dec, eval, params, weight.CtEcd), wantEcd)
 
-	// The registered commitment is its fragments at X^0 .. X^(C-1); the spread
-	// over the weight comes later.
+	// The registered commitment is h(Z), its fragments offset by one at
+	// X^(k*N/C); the spread over the weight comes later.
 	wantCtH := make([]float64, params.RLWE.N())
-	for k, f := range SplitCommitment(params, p.Commitment) {
-		wantCtH[k] = commitFloat(f)
+	for k, f := range storedFragments(params, p.Commitment) {
+		wantCtH[params.FragmentIndex(k)] = commitFloat(f)
 	}
 	assertVec(t, "ctH", DecodeCoeffs(params.RLWE, dec.DecryptNew(reg.CtH), params.Scale()), wantCtH)
 
-	// Applying ctEcd reproduces Fig. 1 line 5's ct_H, doubled, with fragment k
-	// at X^(S*j + k).
+	// Applying ctEcd reproduces Fig. 1 line 5's ct_H, doubled: h(Z) in each of
+	// the party's slots Y^j.
 	ctEcd := rlwe.NewCiphertext(params.RLWE, 1, reg.CtH.Level())
 	encodeH(eval, weight, reg, ctEcd)
 	assertVec(t, "encodeH", DecodeCoeffs(params.RLWE, dec.DecryptNew(ctEcd), params.EncodedScale()), refHVec(params, p))
@@ -85,18 +86,18 @@ func TestAggregate(t *testing.T) {
 	weights := EncryptWeights(enc, params, parties)
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
-	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
+	agg := Aggregate(eval, weights, regs)
 	want := refAggregate(params.RLWE.N(), params.Stride, leaves)
 
 	// 2*Delta, since Aggregate now folds in the 2/(Y-1) of deriveEncoder.
 	assertVec(t, "agg", DecodeCoeffs(params.RLWE, dec.DecryptNew(agg), params.EncodedScale()), want.h)
 }
 
-// TestTrace checks the full trace of the ring on a dense random message:
-// every coefficient but the constant one annihilated, and the constant one
-// scaled by N -- or returned as is, when the ciphertext is first multiplied
-// by N^-1 mod Q, as [Elect] does. The message fills every coefficient, on and
-// off the Y-lattice, so a trace that annihilated only the subring would fail.
+// TestTrace checks the relative trace Tr_{R/Z[Z]} [Elect] applies, on a dense
+// random message: every coefficient off the multiples of N/C annihilated, and
+// those kept scaled by N/C -- or returned as they are, when the ciphertext is
+// first multiplied by (N/C)^-1 mod Q, as [Elect] does. The message fills every
+// coefficient, so a trace that left anything off Z[Z] would show.
 func TestTrace(t *testing.T) {
 	params := SetupParams(8)
 	sk, pk, evk := SetupKeys(params)
@@ -106,6 +107,7 @@ func TestTrace(t *testing.T) {
 	eval := rlwe.NewEvaluator(params.RLWE, evk)
 
 	N := params.RLWE.N()
+	gain := N / params.Fragments
 	ringQ := params.RLWE.RingQ()
 
 	coeffs := make([]uint64, N)
@@ -118,31 +120,40 @@ func TestTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	traced, err := Trace(eval, ct, 2*N)
+	elems := ExtractionGaloisElements(params)
+	if len(elems) != bits.Len(uint(gain))-1 {
+		t.Errorf("%d Galois elements, want log2(N/C) = %d", len(elems), bits.Len(uint(gain))-1)
+	}
+
+	traced, err := Trace(eval, ct, elems)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := make([]float64, N)
-	want[0] = float64(N) * float64(coeffs[0])
+	for i := 0; i < N; i += gain {
+		want[i] = float64(gain) * float64(coeffs[i])
+	}
 	assertVec(t, "trace", DecodeCoeffs(params.RLWE, dec.DecryptNew(traced), params.Scale()), want)
 
-	nInv := new(big.Int).ModInverse(big.NewInt(int64(N)), ringQ.Modulus())
+	inv := new(big.Int).ModInverse(big.NewInt(int64(gain)), ringQ.Modulus())
 	scaled := ct.CopyNew()
-	ringQ.MulScalarBigint(scaled.Value[0], nInv, scaled.Value[0])
-	ringQ.MulScalarBigint(scaled.Value[1], nInv, scaled.Value[1])
+	ringQ.MulScalarBigint(scaled.Value[0], inv, scaled.Value[0])
+	ringQ.MulScalarBigint(scaled.Value[1], inv, scaled.Value[1])
 
-	traced, err = Trace(eval, scaled, 2*N)
+	traced, err = Trace(eval, scaled, elems)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want[0] = float64(coeffs[0])
-	assertVec(t, "N^-1 * trace", DecodeCoeffs(params.RLWE, dec.DecryptNew(traced), params.Scale()), want)
+	for i := 0; i < N; i += gain {
+		want[i] = float64(coeffs[i])
+	}
+	assertVec(t, "(N/C)^-1 * trace", DecodeCoeffs(params.RLWE, dec.DecryptNew(traced), params.Scale()), want)
 }
 
 // TestThresholdDecrypt checks the committee's decryption against decryption
 // under the whole key, which no one holds in an election and the test does:
 // the combined phase must be the true phase plus the committee's flooding,
-// that flooding within its hard bound 2m*F, and actually applied at scale F.
+// that flooding within its hard bound m*F, and actually applied at scale F.
 func TestThresholdDecrypt(t *testing.T) {
 	params := SetupParams(8)
 	sk, pk, _ := SetupKeys(params)
@@ -160,8 +171,8 @@ func TestThresholdDecrypt(t *testing.T) {
 	// A full-width commitment's fragments, at the scale Elect's output carries.
 	want := topCommitment(params.CommitmentBits())
 	coeffs := make([]uint64, params.RLWE.N())
-	for k, f := range SplitCommitment(params, want) {
-		coeffs[k] = f.Uint64()
+	for k, f := range storedFragments(params, want) {
+		coeffs[params.FragmentIndex(k)] = f.Uint64()
 	}
 	ct, err := rlwe.NewEncryptor(params.RLWE, pk).EncryptNew(EncodeCoeffs(params.RLWE, coeffs, params.ResultScale()))
 	if err != nil {
@@ -172,31 +183,31 @@ func TestThresholdDecrypt(t *testing.T) {
 	for j, ks := range keyShares {
 		shares[j] = PartialDecrypt(params, ct, ks)
 	}
-	phases := CombineShares(params, ct, shares)
+	phases := combinedPhase(params, ct, shares)
 
-	if got := DecodeFragments(params, phases); got.Cmp(want) != 0 {
-		t.Errorf("DecodeFragments = %v, want %v", got, want)
+	if got, err := DecodeFragments(params, FinalDecrypt(params, ct, shares)); err != nil || got.Cmp(want) != 0 {
+		t.Errorf("DecodeFragments = %v (%v), want %v", got, err, want)
 	}
 
 	truth := centeredCoeffs(params.RLWE, rlwe.NewDecryptor(params.RLWE, sk).DecryptNew(ct))
 	F := params.FloodBound()
-	bound := new(big.Int).Mul(F, big.NewInt(int64(2*params.CommitteeSize)))
+	bound := new(big.Int).Mul(F, big.NewInt(int64(params.CommitteeSize)))
 	largest := new(big.Int)
 	for k, ph := range phases {
-		flood := new(big.Int).Sub(ph, truth[k])
+		flood := new(big.Int).Sub(ph, truth[params.FragmentIndex(k)])
 		if new(big.Int).Abs(flood).Cmp(bound) > 0 {
-			t.Errorf("coeff %d: flooding 2^%.2f exceeds its bound 2m*F = 2^%.2f", k, log2Abs(flood), log2Abs(bound))
+			t.Errorf("coeff %d: flooding 2^%.2f exceeds its bound m*F = 2^%.2f", k, log2Abs(flood), log2Abs(bound))
 		}
 		if new(big.Int).Abs(flood).Cmp(largest) > 0 {
 			largest.Abs(flood)
 		}
 	}
-	// A sum of 2m uniforms on [-F, F] has standard deviation F*sqrt(2m/3); all
+	// A sum of m uniforms on [-F, F] has standard deviation F*sqrt(m/3); all
 	// C of them below F/4 would mean the flooding is not being applied.
 	if largest.Cmp(new(big.Int).Rsh(F, 2)) < 0 {
 		t.Errorf("flooding too small: largest 2^%.2f, F = 2^%.2f", log2Abs(largest), log2Abs(F))
 	}
-	t.Logf("flooding: largest 2^%.2f, F = 2^%d, bound 2m*F = 2^%.2f",
+	t.Logf("flooding: largest 2^%.2f, F = 2^%d, bound m*F = 2^%.2f",
 		log2Abs(largest), params.LogErrorBound+params.SmudgeBits(), log2Abs(bound))
 }
 
@@ -230,14 +241,15 @@ type refNode struct {
 	h []float64
 }
 
-// refHVec builds the plain ct_H coefficient vector for one [Party]: its k-th
-// fragment at X^(S*j + k) for every slot j below its weight.
+// refHVec builds the plain ct_H coefficient vector for one [Party]: its stored
+// fragment k, h_k + 1, at Y^j Z^k = X^(S*j + k*N/C) for every slot j below its
+// weight.
 func refHVec(params CircuitParams, p Party) []float64 {
 	h := make([]float64, params.RLWE.N())
-	frags := SplitCommitment(params, p.Commitment)
+	frags := storedFragments(params, p.Commitment)
 	for j := 0; j < int(p.Weight); j++ {
 		for k, f := range frags {
-			h[params.Stride*j+k] = commitFloat(f)
+			h[params.Stride*j+params.FragmentIndex(k)] = commitFloat(f)
 		}
 	}
 	return h

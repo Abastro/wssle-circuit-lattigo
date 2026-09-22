@@ -40,21 +40,24 @@ func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta *big.Int) *rlwe
 }
 
 // EncodeCommitment builds the plaintext ct_h encrypts: Delta times the
-// commitment's fragments as the coefficients of a polynomial of degree below C,
+// commitment as the subring element
 //
-//	Delta * (h_0 + h_1 X + ... + h_(C-1) X^(C-1)),   h = sum_k h_k 2^(k*H),
+//	h(Z) = sum_k (h_k + 1) Z^k,   Z = X^(N/C),   h = sum_k h_k 2^(k*H),
 //
-// in the NTT domain. [encodeH] then spreads fragment k over X^(S*j + k) for
-// every slot j of the party's weight, with no change to the aggregator.
+// fragment k at X^(k*N/C) ([CircuitParams.FragmentIndex]), in the NTT domain.
+// Each fragment is offset by one so that it is strictly positive, which is what
+// lets [DecodeFragments] read the winner's rotation off the signs. [encodeH]
+// then places h(Z) in every slot Y^j of the party's weight.
 func EncodeCommitment(params CircuitParams, h *big.Int) *rlwe.Plaintext {
 	pt := rlwe.NewPlaintext(params.RLWE, params.RLWE.MaxLevelQ())
 
 	ringQ := params.RLWE.RingQ().AtLevel(pt.Level())
 	qi, v := new(big.Int), new(big.Int)
 	for k, frag := range SplitCommitment(params, h) {
-		v.Mul(frag, params.Delta)
+		v.Add(frag, big.NewInt(1))
+		v.Mul(v, params.Delta)
 		for j, s := range ringQ.SubRings {
-			pt.Value.Coeffs[j][k] = new(big.Int).Mod(v, qi.SetUint64(s.Modulus)).Uint64()
+			pt.Value.Coeffs[j][params.FragmentIndex(k)] = new(big.Int).Mod(v, qi.SetUint64(s.Modulus)).Uint64()
 		}
 	}
 

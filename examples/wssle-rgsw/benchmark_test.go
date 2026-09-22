@@ -56,7 +56,6 @@ type benchSetup struct {
 	parties []Party
 	enc     *rgsw.Encryptor
 	eval    *rgsw.Evaluator
-	seed    *rlwe.Ciphertext
 	weights []*Weight
 	regs    []*Registration
 }
@@ -86,7 +85,6 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 		parties: parties,
 		enc:     enc,
 		eval:    rgsw.NewEvaluator(params.RLWE, evk),
-		seed:    Identity(enc.Encryptor, params),
 		// Stake is a public parameter, encrypted once per weight update rather
 		// than per election, so it sits outside the measured path.
 		weights: EncryptWeights(enc, params, parties),
@@ -104,7 +102,7 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 
 func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
 	st := setupFor(name, params, n)
-	enc, eval, seed, weights, regs, parties := st.enc, st.eval, st.seed, st.weights, st.regs, st.parties
+	enc, eval, weights, regs, parties := st.enc, st.eval, st.weights, st.regs, st.parties
 
 	var registerTime, aggregateTime, electTime time.Duration
 
@@ -115,7 +113,7 @@ func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
 		registerTime += time.Since(start)
 
 		start = time.Now()
-		agg := Aggregate(eval, seed, weights, regs)
+		agg := Aggregate(eval, weights, regs)
 		aggregateTime += time.Since(start)
 
 		start = time.Now()
@@ -145,7 +143,9 @@ func BenchmarkThresholdDecrypt(b *testing.B) {
 		keyShares := ShareSecretKey(params, sk)
 
 		coeffs := make([]*big.Int, params.RLWE.N())
-		copy(coeffs, SplitCommitment(params, topCommitment(params.CommitmentBits())))
+		for k, f := range storedFragments(params, topCommitment(params.CommitmentBits())) {
+			coeffs[params.FragmentIndex(k)] = f
+		}
 		enc := rlwe.NewEncryptor(params.RLWE, pk)
 		ct, err := enc.EncryptNew(encodeScaled(params, coeffs, params.ResultScale()))
 		if err != nil {
@@ -164,7 +164,9 @@ func BenchmarkThresholdDecrypt(b *testing.B) {
 		})
 		b.Run(ps.Name+"/FinDec", func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				DecodeFragments(params, CombineShares(params, ct, shares))
+				if _, err := DecodeFragments(params, FinalDecrypt(params, ct, shares)); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

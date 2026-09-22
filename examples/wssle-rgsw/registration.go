@@ -39,14 +39,15 @@ type Registration struct {
 // commitment and RGSW-encrypts a fresh randomness monomial Y^r for r sampled
 // uniformly from Z_W.
 //
-// It rejects a commitment wider than C*H bits, and one with a fragment above
-// [CircuitParams.MaxFragment]: the circuit would carry that fragment
-// faithfully until decryption, where it wraps Q and decodes to another value.
+// It rejects a commitment wider than C*H bits, and one whose stored fragment,
+// offset by one ([EncodeCommitment]), exceeds [CircuitParams.MaxFragment]: the
+// circuit would carry that fragment faithfully until decryption, where it
+// wraps Q and decodes to another value.
 func Register(enc *rgsw.Encryptor, params CircuitParams, p Party) *Registration {
 	maxFrag := params.MaxFragment()
 	for _, f := range SplitCommitment(params, p.Commitment) {
-		if f.Cmp(maxFrag) > 0 {
-			panic("commitment fragment above MaxFragment")
+		if new(big.Int).Add(f, big.NewInt(1)).Cmp(maxFrag) > 0 {
+			panic("stored commitment fragment above MaxFragment")
 		}
 	}
 

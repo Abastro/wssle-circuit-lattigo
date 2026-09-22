@@ -1,7 +1,6 @@
 package wsslergsw
 
 import (
-	"math"
 	"math/big"
 	"strconv"
 	"testing"
@@ -43,7 +42,8 @@ func TestWSSLE(t *testing.T) {
 	for _, ps := range ParamSets {
 		t.Run(ps.Name, func(t *testing.T) {
 			params := ps.Params()
-			if top := topCommitment(ps.FragmentBits); top.Cmp(params.MaxFragment()) > 0 {
+			// Stored fragments, h_k + 1, reach 2^H.
+			if top := new(big.Int).Lsh(big.NewInt(1), ps.FragmentBits); top.Cmp(params.MaxFragment()) > 0 {
 				t.Fatalf("set %s cannot carry %d-bit fragments: MaxFragment has %d bits",
 					ps.Name, ps.FragmentBits, params.MaxFragment().BitLen())
 			}
@@ -62,8 +62,8 @@ func TestWSSLE(t *testing.T) {
 // at n = 2, 4, .., 2048 parties sharing the set's W equally, plus n = 1, a
 // single party holding the whole stake -- the one case where [EncodeMonomial]
 // wraps Y^W to -1. Each (set, n) runs sweepTrials elections, all in parallel
-// within a set; each is checked exactly as in TestWSSLE, and logs the sign the
-// winner's fragments came back with, so the negacyclic wraparound is on record.
+// within a set; each is checked exactly as in TestWSSLE, and logs the rotation
+// Z^c the winner's fragments came back with, so the wraparound is on record.
 func TestWSSLESweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("full elections over the whole benchmark grid; skipped in -short mode")
@@ -95,10 +95,10 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	weights := EncryptWeights(enc, params, parties)
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
-	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
+	agg := Aggregate(eval, weights, regs)
 	ctOut := Elect(eval, params, agg)
 
-	winner := predictWinner(t, params, leaves)
+	winner, rotation := predictWinner(params, parties, leaves)
 	want := parties[winner].Commitment
 
 	// The election result, as the committee decrypts it: every member's
@@ -108,37 +108,31 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	for j, ks := range keyShares {
 		shares[j] = PartialDecrypt(params, ctOut, ks)
 	}
-	phases := CombineShares(params, ctOut, shares)
-	if got := DecodeFragments(params, phases); got.Cmp(want) != 0 {
-		t.Errorf("committee decrypted %v, want %v (party %d)", got, want, winner)
+	phases := combinedPhase(params, ctOut, shares)
+	if got, err := DecodeFragments(params, FinalDecrypt(params, ctOut, shares)); err != nil || got.Cmp(want) != 0 {
+		t.Errorf("committee decrypted %v (%v), want %v (party %d)", got, err, want, winner)
 	}
 
 	// Under the whole key, which only the test holds: every coefficient,
-	// exactly -- the winner's fragments at X^0 .. X^(C-1), sharing one sign
-	// (the negacyclic wraparound of Fig. 1 line 16, h* <- |h'|), and zero
-	// everywhere the traces have annihilated, so nothing else is revealed.
+	// exactly -- the winner's stored fragments h_k + 1 rotated by Z^c at
+	// X^(k*N/C), and zero everywhere the trace has annihilated, so nothing
+	// else is revealed.
 	pt := dec.DecryptNew(ctOut)
 	rounded := RoundCoeffs(params.RLWE, pt, params.ResultScale())
-	sign := 0
-	for k, f := range SplitCommitment(params, want) {
-		got := rounded[k]
-		if new(big.Int).Abs(got).Cmp(f) != 0 {
-			t.Errorf("fragment %d = %v, want +-%v (party %d)", k, got, f, winner)
-		}
-		if s := got.Sign(); s != 0 {
-			if sign != 0 && s != sign {
-				t.Errorf("fragment %d has sign %d, fragment 0.. have %d", k, s, sign)
-			}
-			sign = s
+	isFragment := make(map[int]bool)
+	for k, v := range rotateZ(storedFragments(params, want), rotation) {
+		isFragment[params.FragmentIndex(k)] = true
+		if got := rounded[params.FragmentIndex(k)]; got.Cmp(v) != 0 {
+			t.Errorf("coefficient of Z^%d = %v, want %v (party %d, c = %d)", k, got, v, winner, rotation)
 		}
 	}
-	for i, v := range rounded[params.Fragments:] {
-		if v.Sign() != 0 {
-			t.Errorf("coeff[%d] = %v, want 0", params.Fragments+i, v)
+	for i, v := range rounded {
+		if !isFragment[i] && v.Sign() != 0 {
+			t.Errorf("coeff[%d] = %v, want 0", i, v)
 		}
 	}
-	if got := DecodeResult(params, pt); got.Cmp(want) != 0 {
-		t.Errorf("DecodeResult = %v, want %v (party %d)", got, want, winner)
+	if got, err := DecodeResult(params, pt); err != nil || got.Cmp(want) != 0 {
+		t.Errorf("DecodeResult = %v (%v), want %v (party %d)", got, err, want, winner)
 	}
 
 	// The errors are exact too: the evaluation error alone, under the whole
@@ -147,10 +141,16 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	scale := params.ResultScale()
 	halfBits := float64(scale.BitLen() - 2)
 	res := Residuals(params.RLWE, pt, scale)
-	eFrag := log2Abs(maxAbs(res[:params.Fragments]))
+	var fragRes []*big.Int
+	for i, v := range res {
+		if isFragment[i] {
+			fragRes = append(fragRes, v)
+		}
+	}
+	eFrag := log2Abs(maxAbs(fragRes))
 	eTotal := log2Abs(maxAbs(residualsOf(phases, scale)))
-	t.Logf("elected party %d of %d (weight %d, sign %+d): eval error 2^%.2f (margin %.1f bits), with flooding 2^%.2f (margin %.1f bits)",
-		winner, len(parties), parties[winner].Weight, sign, eFrag, halfBits-eFrag, eTotal, halfBits-eTotal)
+	t.Logf("elected party %d of %d (weight %d, c = %d): eval error 2^%.2f (margin %.1f bits), with flooding 2^%.2f (margin %.1f bits)",
+		winner, len(parties), parties[winner].Weight, rotation, eFrag, halfBits-eFrag, eTotal, halfBits-eTotal)
 }
 
 // residualsOf is each value's signed distance to the nearest multiple of scale.
@@ -165,27 +165,54 @@ func residualsOf(vs []*big.Int, scale *big.Int) []*big.Int {
 	return out
 }
 
-// predictWinner runs the plain-Go reference of [Aggregate] on the same weights
-// and randomness as the real run, with each party's commitment replaced by its
-// label i+1, a single small fragment. The float64 reference carries the labels
-// exactly, whatever the width of the real commitments, and the winner's lands
-// at coefficient 0, where its fragment 0 does.
-func predictWinner(t *testing.T, params CircuitParams, leaves []refNode) int {
-	t.Helper()
-
-	rank, stride := params.RLWE.N(), params.Stride
-	labelled := make([]refNode, len(leaves))
-	for i, l := range leaves {
-		label := Party{Weight: l.w, Commitment: big.NewInt(int64(i + 1))}
-		labelled[i] = refNode{w: l.w, r: l.r, h: refHVec(params, label)}
+// predictWinner computes, from the weights and the randomness the parties
+// registered, which party the election must elect and the rotation Z^c its
+// fragments must come back with (references/circuit, Correctness). The first
+// pass leaves party i in the slots from sum_{l>i} w_l on, below
+// sum_{l>=i} w_l; the second rotates everything by Y^r, r = sum_i r_i, which
+// brings slot j* = -r mod W to Y^0 after crossing Y^W = Z
+// c = floor((j* + r)/W) times, mod 2C since Z^(2C) = 1.
+func predictWinner(params CircuitParams, parties []Party, leaves []refNode) (winner, rotation int) {
+	W := int(params.TotalWt)
+	r := 0
+	for _, l := range leaves {
+		r += int(l.r)
 	}
+	jStar := ((-r)%W + W) % W
 
-	h0 := math.Abs(refAggregate(rank, stride, labelled).h[0])
-	winner := int(h0) - 1
-	if float64(winner+1) != h0 || winner < 0 || winner >= len(leaves) {
-		t.Fatalf("reference put %v at coefficient 0, not a party label", h0)
+	above := 0 // total weight of the parties after i
+	for i := len(parties) - 1; i >= 0; i-- {
+		w := int(parties[i].Weight)
+		if jStar >= above && jStar < above+w {
+			winner = i
+		}
+		above += w
 	}
-	return winner
+	return winner, ((jStar + r) / W) % (2 * params.Fragments)
+}
+
+// storedFragments is h's fragments as the circuit carries them, h_k + 1.
+func storedFragments(params CircuitParams, h *big.Int) []*big.Int {
+	frags := SplitCommitment(params, h)
+	for _, f := range frags {
+		f.Add(f, big.NewInt(1))
+	}
+	return frags
+}
+
+// rotateZ multiplies the subring element sum_k v_k Z^k by Z^c, Z^C = -1.
+func rotateZ(v []*big.Int, c int) []*big.Int {
+	C := len(v)
+	out := make([]*big.Int, C)
+	for k := range v {
+		out[k] = new(big.Int).Set(v[k])
+	}
+	for ; c > 0; c-- {
+		last := out[C-1]
+		copy(out[1:], out[:C-1])
+		out[0] = last.Neg(last)
+	}
+	return out
 }
 
 // topParties builds n parties sharing the total weight equally, with distinct

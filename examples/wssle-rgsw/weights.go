@@ -55,11 +55,12 @@ func EncryptWeights(enc *rgsw.Encryptor, params CircuitParams, parties []Party) 
 // including the mu*sk block, which needs no knowledge of sk because the gadget
 // already carries it in the a-column.
 //
-// The second step is where the noise goes. theta = -(1 + Y + ... + Y^(W-1)) is
-// dense (see [thetaQP]), so it carries the phase error e to theta*e, inflating
-// its variance by ||theta||_2^2 = W. That is inherent: multiplying by theta is
-// the prefix sum that spreads a party's commitment across its w slots, and a
-// prefix sum of a random walk grows like sqrt(W).
+// The second step is where the noise goes. theta = -(1 + Y + ... + Y^(C*W-1))
+// is dense (see [thetaQP]), so it carries the phase error e to theta*e,
+// inflating its variance by ||theta||_2^2 = C*W. That is inherent: multiplying
+// by theta is the prefix sum that spreads a party's commitment across its w
+// slots, and a prefix sum of a random walk grows like the square root of its
+// length.
 func deriveEncoder(params CircuitParams, ctW *rgsw.Ciphertext) *rgsw.Ciphertext {
 	p := params.RLWE
 	levelQ, levelP := ctW.LevelQ(), ctW.LevelP()
@@ -108,23 +109,27 @@ func deriveEncoder(params CircuitParams, ctW *rgsw.Ciphertext) *rgsw.Ciphertext 
 // thetaQP builds theta = 2/(Y - 1), in the NTT and Montgomery domain over QP
 // so it can be applied directly to an RGSW ciphertext.
 //
-// (Y - 1) is not invertible in Z[Y]/(Y^W + 1) -- its norm is 2 -- but 2/(Y - 1)
-// is, because (Y - 1)*(1 + Y + ... + Y^(W-1)) = Y^W - 1 = -2. Hence
+// Y = X^S generates the subring Z[Y]/(Y^(C*W) + 1), Y^(C*W) = X^N = -1. (Y - 1)
+// is not invertible there -- its norm is 2 -- but 2/(Y - 1) is, because
+// (Y - 1)*(1 + Y + ... + Y^(C*W-1)) = Y^(C*W) - 1 = -2. Hence
 //
-//	theta = -(1 + Y + ... + Y^(W-1)),
+//	theta = -(1 + Y + ... + Y^(C*W-1)),
 //
 // which as a polynomial in X is -1 at every stride-th coefficient below N.
+// theta*(Y^w - 1) = 2*(1 + ... + Y^(w-1)) for every w <= C*W, and the weights
+// never exceed W.
 func thetaQP(params CircuitParams, ringQP ringqp.Ring) ringqp.Poly {
 	theta := ringQP.NewPoly()
 
+	terms := ringQP.N() / params.Stride // C*W
 	for j, s := range ringQP.RingQ.SubRings {
-		for k := uint64(0); k < params.TotalWt; k++ {
-			theta.Q.Coeffs[j][params.Stride*int(k)] = s.Modulus - 1
+		for k := 0; k < terms; k++ {
+			theta.Q.Coeffs[j][params.Stride*k] = s.Modulus - 1
 		}
 	}
 	for j, s := range ringQP.RingP.SubRings {
-		for k := uint64(0); k < params.TotalWt; k++ {
-			theta.P.Coeffs[j][params.Stride*int(k)] = s.Modulus - 1
+		for k := 0; k < terms; k++ {
+			theta.P.Coeffs[j][params.Stride*k] = s.Modulus - 1
 		}
 	}
 

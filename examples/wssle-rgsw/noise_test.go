@@ -3,7 +3,19 @@ package wsslergsw
 import (
 	"math"
 	"math/big"
+
+	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
+
+// Identity is a fresh encryption of zero under the encryptor's key: the input
+// the noise measurements run their external products on.
+func Identity(enc *rlwe.Encryptor, params CircuitParams) *rlwe.Ciphertext {
+	ct, err := enc.EncryptNew(EncodeCoeffs(params.RLWE, make([]uint64, params.RLWE.N()), params.Delta))
+	if err != nil {
+		panic(err)
+	}
+	return ct
+}
 
 // Helpers for the noise measurements of TestFloodingBudget.
 

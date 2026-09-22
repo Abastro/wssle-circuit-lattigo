@@ -71,13 +71,13 @@ func ShareSecretKey(params CircuitParams, sk *rlwe.SecretKey) []*KeyShare {
 // coefficients, in [0, Q).
 type DecryptionShare []*big.Int
 
-// PartialDecrypt is ThFHE.PartDec: coefficients 0 .. C-1 of c1 * sk_j, each
-// flooded by the sum of two uniforms on [-F, F], F = [CircuitParams.FloodBound].
+// PartialDecrypt is ThFHE.PartDec: the C fragment coefficients of c1 * sk_j, each
+// flooded by a uniform on [-F, F], F = [CircuitParams.FloodBound].
 //
-// Two uniforms rather than one: their sum masks an error of magnitude at most
-// B = F / 2^s to statistical distance 2^(-2s), not 2^(-s) (Dahl et al.,
-// WAHC'23, eprint 2023/815). And uniform rather than Gaussian: bounded support
-// gives the flooding a hard bound, so it can never fail decryption.
+// With F = 2^s * B, this hides an evaluation error of magnitude at most B to
+// statistical distance at most B/F = 2^-s per coefficient, by the smudging lemma
+// (Asharov, Jain, Wichs, eprint 2011/613, Lemma 2.1). And uniform rather than Gaussian: bounded support gives the flooding a
+// hard bound, so it can never fail decryption.
 func PartialDecrypt(params CircuitParams, ct *rlwe.Ciphertext, share *KeyShare) DecryptionShare {
 	ringQ := params.RLWE.RingQ().AtLevel(ct.Level())
 
@@ -87,20 +87,28 @@ func PartialDecrypt(params CircuitParams, ct *rlwe.Ciphertext, share *KeyShare) 
 
 	Q := ringQ.Modulus()
 	F := params.FloodBound()
-	out := extractCoeffs(ringQ, p, params.Fragments)
+	out := extractCoeffs(ringQ, p, fragmentIndices(params))
 	for _, v := range out {
-		v.Add(v, uniformIn(F))
 		v.Add(v, uniformIn(F))
 		v.Mod(v, Q)
 	}
 	return out
 }
 
-// CombineShares is ThFHE.FinDec up to the rounding: the phase c0 + sum_j of
-// the shares, at coefficients 0 .. C-1, centred in (-Q/2, Q/2]. It carries each
-// fragment at [CircuitParams.ResultScale], plus the evaluation error and the
-// flooding; [DecodeFragments] rounds it off into h*.
-func CombineShares(params CircuitParams, ct *rlwe.Ciphertext, shares []DecryptionShare) []*big.Int {
+// FinalDecrypt is ThFHE.FinDec: from the ciphertext and every committee
+// member's [PartialDecrypt] share, it combines them into c0 + sum_j of the
+// shares at the C fragment coefficients and rounds that off
+// [CircuitParams.ResultScale]. It returns the message there: the coefficients
+// of Z^c h(Z) for the elected h(Z), which [DecodeFragments] turns into h*. The
+// factor 2 of the derived encoder is part of the scale, so it is gone here.
+func FinalDecrypt(params CircuitParams, ct *rlwe.Ciphertext, shares []DecryptionShare) []*big.Int {
+	return roundOff(combinedPhase(params, ct, shares), params.ResultScale())
+}
+
+// combinedPhase is FinalDecrypt before its rounding: c0 + sum_j of the shares,
+// centred in (-Q/2, Q/2]. It carries the message at the result scale plus the
+// evaluation error and the flooding, which the tests read off it.
+func combinedPhase(params CircuitParams, ct *rlwe.Ciphertext, shares []DecryptionShare) []*big.Int {
 	if len(shares) != params.CommitteeSize {
 		panic("m-out-of-m decryption needs every committee member's share")
 	}
@@ -111,7 +119,7 @@ func CombineShares(params CircuitParams, ct *rlwe.Ciphertext, shares []Decryptio
 
 	Q := ringQ.Modulus()
 	half := new(big.Int).Rsh(Q, 1)
-	out := extractCoeffs(ringQ, c0, params.Fragments)
+	out := extractCoeffs(ringQ, c0, fragmentIndices(params))
 	for k, v := range out {
 		for _, s := range shares {
 			v.Add(v, s[k])
@@ -124,9 +132,32 @@ func CombineShares(params CircuitParams, ct *rlwe.Ciphertext, shares []Decryptio
 	return out
 }
 
-// extractCoeffs lifts the first count coefficients of p, in the coefficient
-// domain, from RNS to integers in [0, Q) by CRT, Q the modulus at ringQ's level.
-func extractCoeffs(ringQ *ring.Ring, p ring.Poly, count int) []*big.Int {
+// roundOff rounds each value to the nearest multiple of scale and returns the
+// quotient, in integers: floor((v + scale/2) / scale). Div is Euclidean, hence
+// a floor for the positive divisor, including when v is negative.
+func roundOff(vs []*big.Int, scale *big.Int) []*big.Int {
+	half := new(big.Int).Rsh(scale, 1)
+	out := make([]*big.Int, len(vs))
+	for i, v := range vs {
+		out[i] = new(big.Int).Add(v, half)
+		out[i].Div(out[i], scale)
+	}
+	return out
+}
+
+// fragmentIndices is where the C output fragments sit, in fragment order.
+func fragmentIndices(params CircuitParams) []int {
+	idx := make([]int, params.Fragments)
+	for k := range idx {
+		idx[k] = params.FragmentIndex(k)
+	}
+	return idx
+}
+
+// extractCoeffs lifts the coefficients of p at the given indices, in the
+// coefficient domain, from RNS to integers in [0, Q) by CRT, Q the modulus at
+// ringQ's level.
+func extractCoeffs(ringQ *ring.Ring, p ring.Poly, indices []int) []*big.Int {
 	Q := ringQ.Modulus()
 	// AtLevel keeps every prime in SubRings; only the first Level()+1 are live.
 	primes := ringQ.SubRings[:ringQ.Level()+1]
@@ -140,12 +171,12 @@ func extractCoeffs(ringQ *ring.Ring, p ring.Poly, count int) []*big.Int {
 		basis[i] = inv.Mul(inv, Qi)
 	}
 
-	out := make([]*big.Int, count)
+	out := make([]*big.Int, len(indices))
 	r := new(big.Int)
-	for k := range out {
+	for k, idx := range indices {
 		v := new(big.Int)
 		for i := range primes {
-			v.Add(v, r.Mul(r.SetUint64(p.Coeffs[i][k]), basis[i]))
+			v.Add(v, r.Mul(r.SetUint64(p.Coeffs[i][idx]), basis[i]))
 		}
 		out[k] = v.Mod(v, Q)
 	}

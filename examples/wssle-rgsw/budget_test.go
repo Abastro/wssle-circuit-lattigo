@@ -55,24 +55,24 @@ func checkBudget(t *testing.T, ps ParamSet) {
 		t.Errorf("set %s: beta*sigma_0 = 2^%.2f exceeds the stored bound 2^%d", ps.Name, derived, ps.LogErrorBound)
 	}
 
-	// Flooding: 2m uniforms on [-F, F] plus B, against S/2.
+	// Flooding: m uniforms on [-F, F] plus B, against S/2.
 	m := params.CommitteeSize
-	lhs := new(big.Int).Mul(params.FloodBound(), big.NewInt(int64(2*m)))
+	lhs := new(big.Int).Mul(params.FloodBound(), big.NewInt(int64(m)))
 	lhs.Add(lhs, new(big.Int).Lsh(big.NewInt(1), uint(ps.LogErrorBound)))
 	half := new(big.Int).Rsh(params.ResultScale(), 1)
-	t.Logf("m = %d, s = %d, F = 2^%d: 2m*F + B = 2^%.2f against S/2 = 2^%.0f, headroom %+.2f bits",
+	t.Logf("m = %d, s = %d, F = 2^%d: m*F + B = 2^%.2f against S/2 = 2^%.0f, headroom %+.2f bits",
 		m, params.SmudgeBits(), ps.LogErrorBound+params.SmudgeBits(), bitsOf(lhs), bitsOf(half), bitsOf(half)-bitsOf(lhs))
 	if !params.FloodingFits() {
 		t.Errorf("set %s: the committee's flooding does not fit below S/2", ps.Name)
 	}
 
-	// Ceiling: no fragment may wrap Q.
-	top := topCommitment(ps.FragmentBits)
+	// Ceiling: no stored fragment, h_k + 1 <= 2^H, may wrap Q.
+	top := new(big.Int).Lsh(big.NewInt(1), ps.FragmentBits)
 	if top.Cmp(params.MaxFragment()) > 0 {
 		t.Errorf("set %s: %d-bit fragments wrap Q; MaxFragment has only %d bits",
 			ps.Name, ps.FragmentBits, params.MaxFragment().BitLen())
 	} else {
-		t.Logf("ceiling ok: MaxFragment - (2^%d - 1) = 2^%.2f",
+		t.Logf("ceiling ok: MaxFragment - 2^%d = 2^%.2f",
 			ps.FragmentBits, bitsOf(new(big.Int).Sub(params.MaxFragment(), top)))
 	}
 }
@@ -143,13 +143,14 @@ func measureSigmaZero(t *testing.T, params CircuitParams) float64 {
 	// sigma_ecd^2 <= (4W+1) sigma_rlwe^2 + n sigma_ext_tilde^2 + 2n sigma_ext^2
 	ecd := (4*W+1)*sRLWE + n*sExtTilde + 2*n*sExt
 
-	// The full trace, pre-multiplied by N^-1: the aggregate's error passes
-	// through unamplified, while the key-switching error of doubling step t is
-	// doubled by each of the log2(N)-1-t steps after it, which sum to
-	// (N^2 - 1)/3 sigma_ks^2 at the constant coefficient. sigma_ks^2 is taken
-	// as sigma_ext^2: the Galois keys use the same gadget, with less error.
-	N := float64(params.RLWE.N())
-	ks := (N*N - 1) / 3 * sExt
+	// The relative trace Tr_{R/Z[Z]}, pre-multiplied by (N/C)^-1: the
+	// aggregate's error passes through unamplified, while the key-switching
+	// error of doubling step t is doubled by each of the log2(N/C)-1-t steps
+	// after it, which sum to ((N/C)^2 - 1)/3 sigma_ks^2 at every fragment
+	// alike. sigma_ks^2 is taken as sigma_ext^2: the Galois keys use the same
+	// gadget, under sk.
+	g := float64(params.RLWE.N() / params.Fragments)
+	ks := (g*g - 1) / 3 * sExt
 	t.Logf("  sigma_ecd = 2^%.2f  trace key switching = 2^%.2f", lg(ecd), lg(ks))
 	return math.Sqrt(ecd + ks)
 }
