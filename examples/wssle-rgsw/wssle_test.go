@@ -19,22 +19,22 @@ const (
 // commitment exactly against an independent prediction.
 //
 // Each parameter set runs electionTrials elections, every one with fresh keys,
-// weight material, registrations and randomness. The commitments fill the top
-// of the H-bit range, so the no-wrap ceiling is exercised where it binds -- a
-// commitment above [CircuitParams.MaxCommitment] would make [Register] panic.
+// weight material, registrations and randomness. The commitments are 128-bit
+// and fill the top of the range, so every fragment sits near 2^H - 1 and the
+// no-wrap ceiling is exercised where it binds -- a fragment above
+// [CircuitParams.MaxFragment] would make [Register] panic.
 //
 // No flooding is added: threshold decryption is out of scope here (a single
 // secret key stands in for the committee). The flooding only consumes budget,
 // deterministically, and TestFloodingBudget checks that budget.
 func TestWSSLE(t *testing.T) {
 	t.Run("5 parties", func(t *testing.T) {
-		testWSSLE(t, SetupParams(8), []Party{
-			{Weight: 1, Commitment: big.NewInt(250)},
-			{Weight: 2, Commitment: big.NewInt(251)},
-			{Weight: 1, Commitment: big.NewInt(252)},
-			{Weight: 3, Commitment: big.NewInt(253)},
-			{Weight: 1, Commitment: big.NewInt(254)},
-		})
+		params := SetupParams(8)
+		parties := topParties(5, params.CommitmentBits(), 5)
+		for i, w := range []uint64{1, 2, 1, 3, 1} {
+			parties[i].Weight = w
+		}
+		testWSSLE(t, params, parties)
 	})
 
 	if testing.Short() {
@@ -43,15 +43,15 @@ func TestWSSLE(t *testing.T) {
 	for _, ps := range ParamSets {
 		t.Run(ps.Name, func(t *testing.T) {
 			params := ps.Params()
-			if top := topCommitment(ps.CoeffBits); top.Cmp(params.MaxCommitment()) > 0 {
-				t.Fatalf("set %s cannot carry %d-bit commitments: MaxCommitment has %d bits",
-					ps.Name, ps.CoeffBits, params.MaxCommitment().BitLen())
+			if top := topCommitment(ps.FragmentBits); top.Cmp(params.MaxFragment()) > 0 {
+				t.Fatalf("set %s cannot carry %d-bit fragments: MaxFragment has %d bits",
+					ps.Name, ps.FragmentBits, params.MaxFragment().BitLen())
 			}
 			for trial := range electionTrials {
 				// Sets run one after another; a set's trials run in parallel.
 				t.Run("trial"+strconv.Itoa(trial), func(t *testing.T) {
 					t.Parallel()
-					testWSSLE(t, params, topParties(electionParties, ps.CoeffBits, ps.TotalWeight))
+					testWSSLE(t, params, topParties(electionParties, params.CommitmentBits(), ps.TotalWeight))
 				})
 			}
 		})
@@ -69,40 +69,50 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
 	agg := Aggregate(eval, Identity(enc.Encryptor, params), weights, regs)
-	pt := dec.DecryptNew(Elect(eval, agg, params.TotalWt)) // stand-in for ThFHE.Dec(ct_out, I)
+	pt := dec.DecryptNew(Elect(eval, params, agg)) // stand-in for ThFHE.Dec(ct_out, I)
 
 	winner := predictWinner(t, params, leaves)
 	want := parties[winner].Commitment
 
-	// Every coefficient, exactly: the winner at coefficient 0, up to the sign
-	// of the negacyclic wraparound (Fig. 1 line 16: h* <- W^-1 |h'|), and zero
-	// everywhere the trace has annihilated.
+	// Every coefficient, exactly: the winner's fragments at X^0 .. X^(C-1),
+	// sharing one sign (the negacyclic wraparound of Fig. 1 line 16,
+	// h* <- |h'|), and zero everywhere the traces have annihilated.
 	rounded := RoundCoeffs(params.RLWE, pt, params.ResultScale())
-	if got := new(big.Int).Abs(rounded[0]); got.Cmp(want) != 0 {
-		t.Errorf("coeff[0] = %v, want +-%v (party %d)", rounded[0], want, winner)
+	sign := 0
+	for k, f := range SplitCommitment(params, want) {
+		got := rounded[k]
+		if new(big.Int).Abs(got).Cmp(f) != 0 {
+			t.Errorf("fragment %d = %v, want +-%v (party %d)", k, got, f, winner)
+		}
+		if s := got.Sign(); s != 0 {
+			if sign != 0 && s != sign {
+				t.Errorf("fragment %d has sign %d, fragment 0.. have %d", k, s, sign)
+			}
+			sign = s
+		}
 	}
-	for i, v := range rounded[1:] {
+	for i, v := range rounded[params.Fragments:] {
 		if v.Sign() != 0 {
-			t.Errorf("coeff[%d] = %v, want 0", i+1, v)
+			t.Errorf("coeff[%d] = %v, want 0", params.Fragments+i, v)
 		}
 	}
 	if got := DecodeResult(params, pt); got.Cmp(want) != 0 {
 		t.Errorf("DecodeResult = %v, want %v (party %d)", got, want, winner)
 	}
 
-	// The noise is exact too; coefficient 0 is the one the trace amplifies by
-	// W. The margin is how far it sits below the S/2 that rounding tolerates.
+	// The noise is exact too. The margin is how far the largest fragment error
+	// sits below the S/2 that rounding tolerates.
 	res := Residuals(params.RLWE, pt, params.ResultScale())
-	e0 := log2Abs(res[0])
-	t.Logf("elected party %d of %d: |e_0| = 2^%.2f, max over the rest 2^%.2f, S/2 margin %.1f bits",
-		winner, len(parties), e0, log2Abs(maxAbs(res[1:])), float64(params.ResultScale().BitLen()-2)-e0)
+	eFrag := log2Abs(maxAbs(res[:params.Fragments]))
+	t.Logf("elected party %d of %d: max fragment error 2^%.2f, max over the rest 2^%.2f, S/2 margin %.1f bits",
+		winner, len(parties), eFrag, log2Abs(maxAbs(res[params.Fragments:])), float64(params.ResultScale().BitLen()-2)-eFrag)
 }
 
 // predictWinner runs the plain-Go reference of [Aggregate] on the same weights
 // and randomness as the real run, with each party's commitment replaced by its
-// label i+1. The labels are small, so the float64 reference carries them
-// exactly, whatever the width of the real commitments; the trace keeps only
-// coefficient 0, so that is where the winner's label lands.
+// label i+1, a single small fragment. The float64 reference carries the labels
+// exactly, whatever the width of the real commitments, and the winner's lands
+// at coefficient 0, where its fragment 0 does.
 func predictWinner(t *testing.T, params CircuitParams, leaves []refNode) int {
 	t.Helper()
 
@@ -110,7 +120,7 @@ func predictWinner(t *testing.T, params CircuitParams, leaves []refNode) int {
 	labelled := make([]refNode, len(leaves))
 	for i, l := range leaves {
 		label := Party{Weight: l.w, Commitment: big.NewInt(int64(i + 1))}
-		labelled[i] = refNode{w: l.w, r: l.r, h: refHVec(rank, stride, label)}
+		labelled[i] = refNode{w: l.w, r: l.r, h: refHVec(params, label)}
 	}
 
 	h0 := math.Abs(refAggregate(rank, stride, labelled).h[0])

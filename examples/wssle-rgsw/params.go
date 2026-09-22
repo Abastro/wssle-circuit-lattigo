@@ -27,9 +27,9 @@ import (
 	"github.com/tuneinsight/lattigo/v6/ring"
 )
 
-// Each parameter set is sized by two constraints on the scale S = 2*Delta*W
-// that [Elect]'s output carries, one from each side (references/error-analysis,
-// sec:dec):
+// Each parameter set is sized by two constraints on the scale S = 2*Delta that
+// every fragment of [Elect]'s output carries, one from each side
+// (references/error-analysis, sec:dec):
 //
 //	from below   (2|K| 2^s + 1) * beta * sigma_0  <=  S/2
 //	from above   (2^H - 1) * S  +  S/2            <=  Q/2
@@ -42,31 +42,37 @@ import (
 // |e_eval| > B = beta*sigma_0, which beta = 10.08 (10.15 at N = 2^14) makes a
 // 2^-64 event after a union bound over the N coefficients.
 //
-// sigma_0 is the noise at the constant coefficient, the one the trace
-// amplifies coherently. It is derived, not measured -- an election is a single
-// sample of it -- from the measured primitive variances sigma_rlwe, sigma_ext
-// and sigma_ext_tilde, each over a fresh key pair and a fresh RGSW operand per
-// sample (see TestFloodingBudget).
+// sigma_0 is the noise at an output fragment. [Elect] extracts each fragment
+// with the full trace of the ring, pre-multiplied by N^-1 mod Q: the trace is an
+// exact Z-linear map with Tr(e) = N*e_0 for every e in R, noise included, so
+// the pre-multiplication cancels its gain on the aggregate's error outright,
+// and what the trace adds is its own key switching, which the later doubling
+// steps amplify:
 //
-// The upper bound keeps the elected commitment from wrapping Q. It caps S at
+//	sigma_0^2 = sigma_ecd^2 + (N^2 - 1)/3 * sigma_ks^2
+//
+// It is derived, not measured -- an election is a single sample of it -- from
+// the measured primitive variances sigma_rlwe, sigma_ext and sigma_ext_tilde,
+// each over a fresh key pair and a fresh RGSW operand per sample, with
+// sigma_ks^2 taken as sigma_ext^2 (see TestFloodingBudget).
+//
+// The upper bound keeps each fragment from wrapping Q. It caps S at
 // 2^floor(log2 Q - H - 1), with log2 Q the actual size of the prime product:
 // lattigo's primes land a little above or below their nominal sizes, which
 // moves the floor by one when log2 Q - H - 1 falls just short of an integer, as
-// it does for set C. [CircuitParams.MaxCommitment] reports the bound exactly.
+// it does for set C. [CircuitParams.MaxFragment] reports the bound exactly.
 //
 // Lattice security is from the full LWE.estimate of the lattice estimator, not
 // the rough one, which runs only usvp and dual_hybrid and so misses
 // bdd_mitm_hybrid, the attack that binds for this sparse ternary secret:
 //
-//	set  log(QP)  security  sigma_0   flooding headroom
-//	A    416      128.0     2^24.8    +3.8 bits
-//	B    210      127.9     2^22.7    +1.0 bits
-//	C    209      128.5     2^20.8    +0.9 bits
+//	set  log(QP)  security  C x H   sigma_0   flooding headroom
+//	A    416      128.0     1x128   2^15.4    +13.2 bits
+//	B    210      127.9     2x64    2^14.4    +9.2 bits
+//	C    209      128.5     4x32    2^14.4    +7.2 bits
 //
-// Set B is the one whose split matters. With d = 2 the decomposition digit has
-// to stay well under P, while the ceiling wants Q large for its 64-bit
-// coefficients; at log(QP) = 209 the best split measured only +0.1 bits. One
-// more bit, on P, buys the +1.0.
+// In every set it is the trace's key switching that sets sigma_0; the
+// aggregate's own error, 2^9.8 to 2^10.9, is well below it.
 //
 // Unlike the CKKS variant of the same circuit, no multiplicative level chain is
 // needed: the external product consumes no levels, so the modulus is sized
@@ -83,29 +89,29 @@ type ParamSet struct {
 	LogQ, LogP  []int // bit sizes of the Q and P primes; d = ceil(len(LogQ)/len(LogP))
 	LogDelta    int
 	TotalWeight uint64 // W
-	// CoeffBits is H, the bit size of the value one coefficient carries. The
-	// paper splits a commitment over C coefficients; this implementation
-	// places each commitment in a single coefficient, so its commitments are
-	// CoeffBits wide.
-	CoeffBits uint
+	// A commitment is split into Fragments (the paper's C) fragments of
+	// FragmentBits (its H) bits each, the k-th carried by the coefficient of
+	// X^(S*j + k) of its slot j. Fragments must not exceed the stride S.
+	Fragments    int
+	FragmentBits uint
 }
 
-// The three parameter sets of the paper.
+// The three parameter sets of the paper, all for 128-bit commitments.
 var (
 	ParamSetA = ParamSet{
 		Name: "A", LogN: 14,
 		LogQ: []int{50, 50, 50, 50}, LogP: []int{54, 54, 54, 54}, // 200 + 216, d = 1
-		LogDelta: 56, TotalWeight: 1 << 14, CoeffBits: 128,
+		LogDelta: 70, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
 	}
 	ParamSetB = ParamSet{
 		Name: "B", LogN: 13,
 		LogQ: []int{33, 33, 33, 32}, LogP: []int{40, 39}, // 131 + 79, d = 2
-		LogDelta: 53, TotalWeight: 1 << 12, CoeffBits: 64,
+		LogDelta: 65, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
 	}
 	ParamSetC = ParamSet{
 		Name: "C", LogN: 13,
 		LogQ: []int{49, 49}, LogP: []int{56, 55}, // 98 + 111, d = 1
-		LogDelta: 52, TotalWeight: 1 << 11, CoeffBits: 32,
+		LogDelta: 63, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
 	}
 
 	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC}
@@ -113,72 +119,19 @@ var (
 
 // Params builds the [CircuitParams] of the set.
 func (ps ParamSet) Params() CircuitParams {
-	return NewCircuitParams(ps.LogN, ps.LogQ, ps.LogP, ps.LogDelta, ps.TotalWeight)
-}
-
-// CircuitParams holds the ring parameters and packing layout for the circuit.
-type CircuitParams struct {
-	RLWE rlwe.Parameters
-	// Delta is the scaling factor applied to commitments. It is not a free
-	// knob: [CircuitParams.ResultScale] has to leave room for the flooding
-	// noise below and [CircuitParams.MaxCommitment] above (see [ParamSet]).
-	Delta   uint64
-	Stride  int    // S = N/W, the packing stride: Y = X^S generates the subring.
-	TotalWt uint64 // W, the public total weight.
-}
-
-// Scale is the factor a freshly encrypted commitment carries: Delta alone.
-func (p CircuitParams) Scale() *big.Int {
-	return new(big.Int).SetUint64(p.Delta)
-}
-
-// EncodedScale is the factor a party's contribution carries once [encodeH] has
-// applied the 2/(Y-1) of [deriveEncoder]: 2*Delta.
-func (p CircuitParams) EncodedScale() *big.Int {
-	return new(big.Int).Lsh(p.Scale(), 1)
-}
-
-// ResultScale is the factor [Elect]'s output carries on the elected
-// commitment: Delta from the encoding, 2 from 2/(Y-1), and W from the trace.
-// All three are divided out in the clear, which is exact and free -- the
-// election result is public.
-//
-// It is a [big.Int] because it does not fit a uint64: the flooding noise that
-// threshold decryption needs takes it to 2^64 and beyond (2^71 for set A).
-func (p CircuitParams) ResultScale() *big.Int {
-	return new(big.Int).Mul(p.EncodedScale(), new(big.Int).SetUint64(p.TotalWt))
-}
-
-// MaxCommitment is the largest commitment [Elect]'s output can carry without
-// wrapping Q: the largest h with h*S + S/2 <= Q/2, S = [CircuitParams.ResultScale],
-// where S/2 is the most error the final rounding tolerates. [Register] rejects
-// anything larger.
-func (p CircuitParams) MaxCommitment() *big.Int {
-	scale := p.ResultScale()
-	h := new(big.Int).Rsh(p.RLWE.RingQ().Modulus(), 1) // floor(Q/2): Q is odd
-	h.Sub(h, new(big.Int).Rsh(scale, 1))
-	return h.Div(h, scale)
-}
-
-// SetupParams builds [CircuitParams] on set C's ring and modulus for an
-// election of any other public total weight, which must be a power of two
-// dividing the ring degree. The step tests use it with small W.
-func SetupParams(totalWeight uint64) CircuitParams {
-	c := ParamSetC
-	return NewCircuitParams(c.LogN, c.LogQ, c.LogP, c.LogDelta, totalWeight)
-}
-
-// NewCircuitParams builds [CircuitParams] on an explicit ring and modulus.
-func NewCircuitParams(logN int, logQ, logP []int, logDelta int, totalWeight uint64) CircuitParams {
-	N := 1 << logN
-	if totalWeight == 0 || N%int(totalWeight) != 0 {
+	N := 1 << ps.LogN
+	W := ps.TotalWeight
+	if W == 0 || N%int(W) != 0 {
 		panic("total weight must divide the ring degree")
+	}
+	if ps.Fragments < 1 || ps.Fragments > N/int(W) {
+		panic("fragments per commitment must lie in [1, N/W]")
 	}
 
 	params, err := rlwe.NewParametersFromLiteral(rlwe.ParametersLiteral{
-		LogN:    logN,
-		LogQ:    logQ,
-		LogP:    logP,
+		LogN:    ps.LogN,
+		LogQ:    ps.LogQ,
+		LogP:    ps.LogP,
 		Xs:      ring.Ternary{H: hammingWeight},
 		Xe:      ring.DiscreteGaussian{Sigma: sigma, Bound: 6 * sigma},
 		NTTFlag: true,
@@ -188,15 +141,75 @@ func NewCircuitParams(logN int, logQ, logP []int, logDelta int, totalWeight uint
 	}
 
 	return CircuitParams{
-		RLWE:    params,
-		Delta:   1 << logDelta,
-		Stride:  N / int(totalWeight),
-		TotalWt: totalWeight,
+		RLWE:         params,
+		Delta:        new(big.Int).Lsh(big.NewInt(1), uint(ps.LogDelta)),
+		Stride:       N / int(W),
+		TotalWt:      W,
+		Fragments:    ps.Fragments,
+		FragmentBits: ps.FragmentBits,
 	}
 }
 
+// SetupParams builds [CircuitParams] on set C's ring, modulus and fragment
+// layout for an election of any other public total weight, which must be a
+// power of two with N/W at least set C's four fragments. The step tests use it
+// with small W.
+func SetupParams(totalWeight uint64) CircuitParams {
+	c := ParamSetC
+	c.TotalWeight = totalWeight
+	return c.Params()
+}
+
+// CircuitParams holds the ring parameters and packing layout for the circuit.
+type CircuitParams struct {
+	RLWE rlwe.Parameters
+	// Delta is the scaling factor applied to commitment fragments. It is not a
+	// free knob: [CircuitParams.ResultScale] has to leave room for the flooding
+	// noise below and [CircuitParams.MaxFragment] above (see [ParamSet]).
+	Delta   *big.Int
+	Stride  int    // S = N/W, the packing stride: Y = X^S generates the subring.
+	TotalWt uint64 // W, the public total weight.
+
+	Fragments    int  // C, the fragments per commitment
+	FragmentBits uint // H, the bits per fragment
+}
+
+// CommitmentBits is the width of a commitment, C*H.
+func (p CircuitParams) CommitmentBits() uint {
+	return uint(p.Fragments) * p.FragmentBits
+}
+
+// Scale is the factor a freshly encrypted fragment carries: Delta alone.
+func (p CircuitParams) Scale() *big.Int {
+	return new(big.Int).Set(p.Delta)
+}
+
+// EncodedScale is the factor a party's contribution carries once [encodeH] has
+// applied the 2/(Y-1) of [deriveEncoder]: 2*Delta.
+func (p CircuitParams) EncodedScale() *big.Int {
+	return new(big.Int).Lsh(p.Delta, 1)
+}
+
+// ResultScale is the factor each fragment of [Elect]'s output carries: the
+// same 2*Delta as the aggregate. The trace would multiply it by N, but [Elect]
+// pre-multiplies by N^-1 mod Q, which cancels that exactly.
+func (p CircuitParams) ResultScale() *big.Int {
+	return p.EncodedScale()
+}
+
+// MaxFragment is the largest fragment [Elect]'s output can carry without
+// wrapping Q: the largest h with h*S + S/2 <= Q/2, S = [CircuitParams.ResultScale],
+// where S/2 is the most error the final rounding tolerates. The same bound
+// covers the aggregate, whose coefficients carry fragments at the same scale.
+func (p CircuitParams) MaxFragment() *big.Int {
+	scale := p.ResultScale()
+	h := new(big.Int).Rsh(p.RLWE.RingQ().Modulus(), 1) // floor(Q/2): Q is odd
+	h.Sub(h, new(big.Int).Rsh(scale, 1))
+	return h.Div(h, scale)
+}
+
 // SetupKeys generates the secret key, the public key parties encrypt under,
-// and the automorphism keys [Trace] needs.
+// and the automorphism keys of the full trace [Elect] applies.
 //
 // There is no relinearization key: this variant never multiplies two
 // ciphertexts anywhere (see [Elect]), so Galois keys are the only evaluation
@@ -218,6 +231,6 @@ func SetupKeys(params CircuitParams) (*rlwe.SecretKey, *rlwe.PublicKey, rlwe.Eva
 	kgen := rlwe.NewKeyGenerator(params.RLWE)
 	sk := kgen.GenSecretKeyNew()
 	pk := kgen.GenPublicKeyNew(sk)
-	gks := kgen.GenGaloisKeysNew(TraceGaloisElements(2*int(params.TotalWt)), sk)
+	gks := kgen.GenGaloisKeysNew(TraceGaloisElements(2*params.RLWE.N()), sk)
 	return sk, pk, rlwe.NewMemEvaluationKeySet(nil, gks...)
 }

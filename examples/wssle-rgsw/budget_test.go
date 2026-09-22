@@ -79,15 +79,15 @@ func checkBudget(t *testing.T, ps ParamSet) {
 	t.Logf("flooding hard bound = 2^%d * B = 2^%.2f", floodBits, float64(floodBits)+math.Log2(B))
 	t.Logf("scale needed >= 2^%.2f   have 2^%.0f   headroom %+.2f bits", need, have, have-need)
 
-	// Upper bound: the elected commitment must not wrap Q, which is what
-	// [CircuitParams.MaxCommitment] bounds, exactly.
-	top := topCommitment(ps.CoeffBits)
-	if top.Cmp(params.MaxCommitment()) > 0 {
-		t.Errorf("set %s: %d-bit commitments wrap Q; MaxCommitment has only %d bits",
-			ps.Name, ps.CoeffBits, params.MaxCommitment().BitLen())
+	// Upper bound: no fragment may wrap Q, which is what
+	// [CircuitParams.MaxFragment] bounds, exactly.
+	top := topCommitment(ps.FragmentBits)
+	if top.Cmp(params.MaxFragment()) > 0 {
+		t.Errorf("set %s: %d-bit fragments wrap Q; MaxFragment has only %d bits",
+			ps.Name, ps.FragmentBits, params.MaxFragment().BitLen())
 	} else {
-		t.Logf("ceiling ok: MaxCommitment - (2^%d - 1) = 2^%.2f",
-			ps.CoeffBits, bitsOf(new(big.Int).Sub(params.MaxCommitment(), top)))
+		t.Logf("ceiling ok: MaxFragment - (2^%d - 1) = 2^%.2f",
+			ps.FragmentBits, bitsOf(new(big.Int).Sub(params.MaxFragment(), top)))
 	}
 
 	if have < need {
@@ -95,8 +95,9 @@ func checkBudget(t *testing.T, ps ParamSet) {
 	}
 }
 
-// measureSigmaZero measures the three primitive variances and runs the chain of
-// references/error-analysis. Same method as TestNoiseModel, per parameter set.
+// measureSigmaZero measures the three primitive variances and derives sigma_0,
+// the noise at an output fragment, through the chain of references/error-analysis
+// and the pre-multiplied full trace of [Elect].
 func measureSigmaZero(t *testing.T, params CircuitParams) float64 {
 	const reps = 256
 
@@ -157,8 +158,18 @@ func measureSigmaZero(t *testing.T, params CircuitParams) float64 {
 	t.Logf("  cross-check: closed-form sigma_ext_tilde = 2^%.2f (D = %.4g)",
 		lg(sExt+(W-1)*decompositionVariance(params)), decompositionVariance(params))
 
+	// sigma_ecd^2 <= (4W+1) sigma_rlwe^2 + n sigma_ext_tilde^2 + 2n sigma_ext^2
 	ecd := (4*W+1)*sRLWE + n*sExtTilde + 2*n*sExt
-	return math.Sqrt(W * W * (ecd + sExt/3))
+
+	// The full trace, pre-multiplied by N^-1: the aggregate's error passes
+	// through unamplified, while the key-switching error of doubling step t is
+	// doubled by each of the log2(N)-1-t steps after it, which sum to
+	// (N^2 - 1)/3 sigma_ks^2 at the constant coefficient. sigma_ks^2 is taken
+	// as sigma_ext^2: the Galois keys use the same gadget, with less error.
+	N := float64(params.RLWE.N())
+	ks := (N*N - 1) / 3 * sExt
+	t.Logf("  sigma_ecd = 2^%.2f  trace key switching = 2^%.2f", lg(ecd), lg(ks))
+	return math.Sqrt(ecd + ks)
 }
 
 // decompositionVariance returns D = (2dNB^2/3p^2) * sigma_rgsw^2, the part of an

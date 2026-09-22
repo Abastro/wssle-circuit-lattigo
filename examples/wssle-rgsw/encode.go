@@ -19,14 +19,16 @@ import (
 // multiplier, not a scaled message -- and [CircuitParams.Delta] for a scaled
 // message. ct_H itself goes through [EncodeCommitment], since a commitment
 // need not fit a uint64.
-func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta uint64) *rlwe.Plaintext {
+func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta *big.Int) *rlwe.Plaintext {
 	pt := rlwe.NewPlaintext(params, params.MaxLevelQ())
 
 	ringQ := params.RingQ().AtLevel(pt.Level())
+	qi, dq := new(big.Int), new(big.Int)
 	for j, s := range ringQ.SubRings {
 		q, dst := s.Modulus, pt.Value.Coeffs[j]
+		d := dq.Mod(delta, qi.SetUint64(q)).Uint64()
 		for i, c := range coeffs {
-			dst[i] = mulMod(c, delta, q)
+			dst[i] = mulMod(c, d, q)
 		}
 	}
 
@@ -37,19 +39,23 @@ func EncodeCoeffs(params rlwe.Parameters, coeffs []uint64, delta uint64) *rlwe.P
 	return pt
 }
 
-// EncodeCommitment builds the plaintext Delta*h, in the NTT domain: the
-// constant polynomial ct_H encrypts. h may be wider than a machine word, so
-// Delta*h is formed exactly and reduced into each RNS prime.
+// EncodeCommitment builds the plaintext ct_h encrypts: Delta times the
+// commitment's fragments as the coefficients of a polynomial of degree below C,
+//
+//	Delta * (h_0 + h_1 X + ... + h_(C-1) X^(C-1)),   h = sum_k h_k 2^(k*H),
+//
+// in the NTT domain. [encodeH] then spreads fragment k over X^(S*j + k) for
+// every slot j of the party's weight, with no change to the aggregator.
 func EncodeCommitment(params CircuitParams, h *big.Int) *rlwe.Plaintext {
 	pt := rlwe.NewPlaintext(params.RLWE, params.RLWE.MaxLevelQ())
 
-	v := new(big.Int).Mul(h, params.Scale())
-	qi, r := new(big.Int), new(big.Int)
-
 	ringQ := params.RLWE.RingQ().AtLevel(pt.Level())
-	for j, s := range ringQ.SubRings {
-		qi.SetUint64(s.Modulus)
-		pt.Value.Coeffs[j][0] = r.Mod(v, qi).Uint64()
+	qi, v := new(big.Int), new(big.Int)
+	for k, frag := range SplitCommitment(params, h) {
+		v.Mul(frag, params.Delta)
+		for j, s := range ringQ.SubRings {
+			pt.Value.Coeffs[j][k] = new(big.Int).Mod(v, qi.SetUint64(s.Modulus)).Uint64()
+		}
 	}
 
 	ringQ.NTT(pt.Value, pt.Value)
@@ -57,6 +63,31 @@ func EncodeCommitment(params CircuitParams, h *big.Int) *rlwe.Plaintext {
 	pt.IsMontgomery = false
 
 	return pt
+}
+
+// SplitCommitment returns the C fragments of h, least significant first, each
+// FragmentBits wide. h must be non-negative and fit CommitmentBits.
+func SplitCommitment(params CircuitParams, h *big.Int) []*big.Int {
+	if h.Sign() < 0 || uint(h.BitLen()) > params.CommitmentBits() {
+		panic("commitment outside [0, 2^(C*H))")
+	}
+	mask := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), params.FragmentBits), big.NewInt(1))
+	frags := make([]*big.Int, params.Fragments)
+	for k := range frags {
+		frags[k] = new(big.Int).Rsh(h, uint(k)*params.FragmentBits)
+		frags[k].And(frags[k], mask)
+	}
+	return frags
+}
+
+// JoinFragments is the inverse of [SplitCommitment].
+func JoinFragments(params CircuitParams, frags []*big.Int) *big.Int {
+	h := new(big.Int)
+	for k := len(frags) - 1; k >= 0; k-- {
+		h.Lsh(h, params.FragmentBits)
+		h.Add(h, frags[k])
+	}
+	return h
 }
 
 // EncodeMonomial builds the plaintext Y^exp = X^{Stride*exp}, for any
@@ -95,10 +126,7 @@ func EncodeMonomial(params CircuitParams, exp uint64) *rlwe.Plaintext {
 // plaintext's coefficients and divides them by divisor.
 //
 // divisor is [CircuitParams.Scale] for an ordinary plaintext and
-// [CircuitParams.ResultScale] for [Elect]'s output, whose constant coefficient
-// carries the trace's factor of W (Fig. 1, line 16: h* <- W^-1 |h'|). Undoing
-// W here rather than homomorphically is exact and free: the election result is
-// public, so the division happens in the clear on an integer.
+// [CircuitParams.ResultScale] for [Elect]'s output.
 //
 // The float64 result is for inspection only. It cannot round off a commitment
 // wider than 53 bits -- [RoundCoeffs] does that, in integers -- nor measure

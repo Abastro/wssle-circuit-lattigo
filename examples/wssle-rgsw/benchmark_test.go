@@ -50,8 +50,6 @@ func benchmarkWSSLE(b *testing.B, params CircuitParams, n int) {
 	for i := range parties {
 		parties[i].Weight = params.TotalWt / uint64(n)
 	}
-	totalWeight := params.TotalWt
-
 	sk, pk, evk := SetupKeys(params)
 
 	enc := rgsw.NewEncryptor(params.RLWE, pk)
@@ -84,7 +82,7 @@ func benchmarkWSSLE(b *testing.B, params CircuitParams, n int) {
 		aggregateTime += time.Since(start)
 
 		start = time.Now()
-		ctOut := Elect(eval, agg, totalWeight)
+		ctOut := Elect(eval, params, agg)
 		electTime += time.Since(start)
 
 		start = time.Now()

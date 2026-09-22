@@ -11,7 +11,7 @@ import (
 // Party is one participant's private input: its stake weight and its
 // leader-commitment value. Commitment stands in for H(x_i) of the protocol --
 // a plain non-negative integer, since the circuit only ever moves it around,
-// but a [big.Int], since the parameter sets carry up to 128 bits of it.
+// but a [big.Int], since the parameter sets carry 128 bits of it.
 //
 // Only Commitment is registered per election; Weight goes through
 // [EncryptWeight] once, as a public parameter.
@@ -24,8 +24,9 @@ type Party struct {
 // its commitment as a plain RLWE ciphertext, and its randomness RGSW-encrypted
 // since [Aggregate] uses it as the hidden multiplier of an external product.
 //
-// Note the commitment is encrypted as the *constant* Delta*h, not as the
-// weight-dependent encoding h*(Y^w - 1)/(Y - 1) of Fig. 1 line 5. The encoding
+// Note the commitment is encrypted as Delta*(h_0 + h_1 X + ... ), its fragments
+// as a polynomial of degree below C, not as the weight-dependent encoding
+// h*(Y^w - 1)/(Y - 1) of Fig. 1 line 5. The encoding
 // is applied by the aggregator instead, from the public [Weight.CtEcd] (see
 // [encodeH]), so a party cannot register a commitment spread over a weight
 // other than its own.
@@ -38,12 +39,15 @@ type Registration struct {
 // commitment and RGSW-encrypts a fresh randomness monomial Y^r for r sampled
 // uniformly from Z_W.
 //
-// It rejects a commitment above [CircuitParams.MaxCommitment]: the circuit
-// would carry it faithfully until the last step, where it wraps Q and decodes
-// to a different value.
+// It rejects a commitment wider than C*H bits, and one with a fragment above
+// [CircuitParams.MaxFragment]: the circuit would carry that fragment
+// faithfully until decryption, where it wraps Q and decodes to another value.
 func Register(enc *rgsw.Encryptor, params CircuitParams, p Party) *Registration {
-	if p.Commitment.Sign() < 0 || p.Commitment.Cmp(params.MaxCommitment()) > 0 {
-		panic("commitment outside [0, MaxCommitment]")
+	maxFrag := params.MaxFragment()
+	for _, f := range SplitCommitment(params, p.Commitment) {
+		if f.Cmp(maxFrag) > 0 {
+			panic("commitment fragment above MaxFragment")
+		}
 	}
 
 	// W is a power of two, so this reduction is unbiased.
