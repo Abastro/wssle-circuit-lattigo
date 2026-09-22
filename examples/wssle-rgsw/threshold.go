@@ -76,8 +76,9 @@ type DecryptionShare []*big.Int
 //
 // With F = 2^s * B, this hides an evaluation error of magnitude at most B to
 // statistical distance at most B/F = 2^-s per coefficient, by the smudging lemma
-// (Asharov, Jain, Wichs, eprint 2011/613, Lemma 2.1). And uniform rather than Gaussian: bounded support gives the flooding a
-// hard bound, so it can never fail decryption.
+// (Asharov, Jain, Wichs, eprint 2011/613, Lemma 2.1). And uniform rather than
+// Gaussian: bounded support gives the flooding a hard bound, so it can never
+// fail decryption.
 func PartialDecrypt(params CircuitParams, ct *rlwe.Ciphertext, share *KeyShare) DecryptionShare {
 	ringQ := params.RLWE.RingQ().AtLevel(ct.Level())
 

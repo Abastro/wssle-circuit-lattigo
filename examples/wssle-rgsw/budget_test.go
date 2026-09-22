@@ -9,11 +9,11 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
-// betaForFailure returns the beta with n*erfc(beta/sqrt2) = 2^-statSecurity,
+// betaForFailure returns the beta with n*erfc(beta/sqrt2) = 2^-failureBits,
 // the tail parameter of prop:err-dec in references/error-analysis. The union
 // bound runs over the C coefficients the committee decrypts.
 func betaForFailure(n int) float64 {
-	target := math.Exp2(-statSecurity)
+	target := math.Exp2(-failureBits)
 	lo, hi := 1.0, 30.0
 	for i := 0; i < 200; i++ {
 		mid := (lo + hi) / 2
@@ -50,7 +50,7 @@ func checkBudget(t *testing.T, ps ParamSet) {
 	beta := betaForFailure(params.Fragments)
 	derived := math.Log2(beta * sigma0)
 	t.Logf("sigma_0 = 2^%.2f  beta = %.3f (2^-%d over C = %d)  beta*sigma_0 = 2^%.2f  stored B = 2^%d (%+.2f bits)",
-		math.Log2(sigma0), beta, statSecurity, params.Fragments, derived, ps.LogErrorBound, float64(ps.LogErrorBound)-derived)
+		math.Log2(sigma0), beta, failureBits, params.Fragments, derived, ps.LogErrorBound, float64(ps.LogErrorBound)-derived)
 	if derived > float64(ps.LogErrorBound) {
 		t.Errorf("set %s: beta*sigma_0 = 2^%.2f exceeds the stored bound 2^%d", ps.Name, derived, ps.LogErrorBound)
 	}
@@ -79,7 +79,7 @@ func checkBudget(t *testing.T, ps ParamSet) {
 
 // measureSigmaZero measures the three primitive variances and derives sigma_0,
 // the noise at an output fragment, through the chain of references/error-analysis
-// and the pre-multiplied full trace of [Elect].
+// and the pre-multiplied relative trace of [Elect].
 func measureSigmaZero(t *testing.T, params CircuitParams) float64 {
 	const reps = 256
 

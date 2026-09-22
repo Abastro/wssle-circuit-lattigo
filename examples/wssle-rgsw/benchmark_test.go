@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,8 +37,14 @@ import (
 //
 // Commitments are the 32-bit values of [uniformParties] for every set; the
 // commitment value does not affect the cost of any phase.
+//
+// Before the first measurement the process warms up for benchWarmUp, untimed:
+// until khugepaged has collapsed the heap into transparent huge pages, about
+// one 10 s scan interval into the process, set A runs some 40% slower
+// (benchmarks/16).
 func BenchmarkWSSLE(b *testing.B) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	warmUpOnce.Do(warmUp)
 
 	for _, ps := range ParamSets {
 		b.Run(ps.Name, func(b *testing.B) {
@@ -48,6 +55,24 @@ func BenchmarkWSSLE(b *testing.B) {
 				})
 			}
 		})
+	}
+}
+
+// benchWarmUp is how long [warmUp] runs: one khugepaged scan interval, 10 s,
+// with margin.
+const benchWarmUp = 15 * time.Second
+
+var warmUpOnce sync.Once
+
+// warmUp runs set A's election at n = 2 until benchWarmUp has passed, so the
+// heap the measurements use has been collapsed into huge pages. Set A is the
+// set with the largest polynomials, and the one the slow start was seen on.
+func warmUp() {
+	params := ParamSetA.Params()
+	st := setupFor(ParamSetA.Name, params, 2)
+	for start := time.Now(); time.Since(start) < benchWarmUp; {
+		st.regs[0] = Register(st.enc, params, st.parties[0])
+		Elect(st.eval, params, Aggregate(st.eval, st.weights, st.regs))
 	}
 }
 

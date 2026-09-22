@@ -81,9 +81,12 @@ import (
 // bdd_mitm_hybrid, the attack that binds for this sparse ternary secret:
 //
 //	set  log(QP)     security  d  C x H   sigma_0   B      flooding headroom
-//	A    236 + 180   128.0     2  1x128   2^15.4    2^19   +17 bits
-//	B    159 + 51    127.9     4  2x64    2^14.3    2^18   +5 bits
-//	C    132 + 77    128.5     2  4x32    2^13.2    2^17   +10 bits
+//	A    236 + 180   128.0     2  1x128   2^15.4    2^19   +18 bits
+//	B    159 + 51    127.9     4  2x64    2^14.3    2^18   +6 bits
+//	C    132 + 77    128.5     2  4x32    2^13.2    2^17   +11 bits
+//	ALow 200 + 216   128.0     1  1x128   2^15.4    2^19   +6 bits   (s = 40)
+//	BLow 131 + 79    127.9     2  2x64    2^13.5    2^17   +3 bits   (s = 40)
+//	CLow 98 + 111    128.5     1  4x32    2^12.5    2^16   +2 bits   (s = 40)
 //
 // In set A it is the trace's key switching that sets sigma_0. In sets B and C
 // the relative trace's key switching, ((N/C)^2 - 1)/3 sigma_ks^2, is C^2 smaller
@@ -97,11 +100,10 @@ const (
 	hammingWeight = 256
 	sigma         = 3.2
 
-	// statSecurity is the statistical distance, about 2^-statSecurity, to which
-	// the flooding hides the evaluation error at each decrypted coefficient; the
-	// same 64 bits bound the decryption failure probability through B (see
-	// [ParamSet.LogErrorBound]).
-	statSecurity = 64
+	// failureBits bounds the decryption failure probability, 2^-failureBits,
+	// through B (see [ParamSet.LogErrorBound]). It is the same for every set,
+	// whatever its [ParamSet.StatSecurity].
+	failureBits = 64
 )
 
 // ParamSet is one row of the paper's parameter table.
@@ -123,6 +125,10 @@ type ParamSet struct {
 	// CommitteeSize is m, the size of the key committee, which is separate from
 	// the parties and decrypts m-out-of-m.
 	CommitteeSize int
+	// StatSecurity is s, the statistical security of threshold decryption: the
+	// flooding hides the evaluation error at each decrypted coefficient to
+	// statistical distance about 2^-s ([CircuitParams.SmudgeBits]).
+	StatSecurity int
 	// LogErrorBound is log2 B, a bound on the evaluation error at an output
 	// fragment holding except with probability 2^-64: B >= beta*sigma_0 with
 	// C*erfc(beta/sqrt2) = 2^-64, sigma_0 as derived by TestFloodingBudget,
@@ -130,29 +136,52 @@ type ParamSet struct {
 	LogErrorBound int
 }
 
-// The three parameter sets of the paper, all for 128-bit commitments and a
-// committee of 32.
+// The parameter sets of the paper, all for 128-bit commitments and a committee
+// of 32: A, B and C at 64-bit statistical security.
 var (
 	ParamSetA = ParamSet{
 		Name: "A", LogN: 14,
 		LogQ: []int{40, 40, 39, 39, 39, 39}, LogP: []int{60, 60, 60}, // 236 + 180, d = 2
 		LogDelta: 106, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
-		CommitteeSize: 32, LogErrorBound: 19,
+		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 19,
 	}
 	ParamSetB = ParamSet{
 		Name: "B", LogN: 13,
 		LogQ: []int{20, 20, 20, 20, 20, 20, 20, 19}, LogP: []int{26, 25}, // 159 + 51, d = 4
 		LogDelta: 93, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
-		CommitteeSize: 32, LogErrorBound: 18,
+		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 18,
 	}
 	ParamSetC = ParamSet{
 		Name: "C", LogN: 13,
 		LogQ: []int{33, 33, 33, 33}, LogP: []int{39, 38}, // 132 + 77, d = 2
 		LogDelta: 97, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
-		CommitteeSize: 32, LogErrorBound: 17,
+		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 17,
 	}
 
-	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC}
+	// The same three at 40-bit statistical security, s = 40, on the layouts the
+	// smaller flood allows: fewer gadget digits (d = 1, 2, 1), so a faster
+	// external product. Same ring, log(QP) and so lattice security as A, B, C
+	// (416, 210, 209), and the same 2^-64 failure probability.
+	ParamSetALow = ParamSet{
+		Name: "ALow", LogN: 14,
+		LogQ: []int{50, 50, 50, 50}, LogP: []int{54, 54, 54, 54}, // 200 + 216, d = 1
+		LogDelta: 70, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
+		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 19,
+	}
+	ParamSetBLow = ParamSet{
+		Name: "BLow", LogN: 13,
+		LogQ: []int{33, 33, 33, 32}, LogP: []int{40, 39}, // 131 + 79, d = 2
+		LogDelta: 65, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
+		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 17,
+	}
+	ParamSetCLow = ParamSet{
+		Name: "CLow", LogN: 13,
+		LogQ: []int{49, 49}, LogP: []int{56, 55}, // 98 + 111, d = 1
+		LogDelta: 63, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
+		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 16,
+	}
+
+	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC, ParamSetALow, ParamSetBLow, ParamSetCLow}
 )
 
 // Params builds the [CircuitParams] of the set.
@@ -182,6 +211,7 @@ func (ps ParamSet) Params() CircuitParams {
 	cp := CircuitParams{
 		RLWE:          params,
 		Delta:         new(big.Int).Lsh(big.NewInt(1), uint(ps.LogDelta)),
+		StatSecurity:  ps.StatSecurity,
 		Stride:        N / (C * int(W)),
 		TotalWt:       W,
 		Fragments:     ps.Fragments,
@@ -222,6 +252,7 @@ type CircuitParams struct {
 	FragmentBits uint // H, the bits per fragment
 
 	CommitteeSize int // m, the key committee
+	StatSecurity  int // s, see [ParamSet.StatSecurity]
 	LogErrorBound int // log2 B, see [ParamSet.LogErrorBound]
 }
 
@@ -257,9 +288,10 @@ func (p CircuitParams) ResultScale() *big.Int {
 
 // SmudgeBits is s, the ratio 2^s of the flooding range to the error bound B:
 // the flooding hides each decrypted coefficient's evaluation error to
-// statistical distance about 2^-s (the smudging lemma), so s = statSecurity.
+// statistical distance about 2^-s (the smudging lemma), so s is the set's
+// [ParamSet.StatSecurity].
 func (p CircuitParams) SmudgeBits() int {
-	return statSecurity
+	return p.StatSecurity
 }
 
 // FloodBound is F = 2^s * B: each member floods each coefficient of its share

@@ -19,13 +19,12 @@ const (
 //
 // Each parameter set runs electionTrials elections, every one with fresh keys,
 // weight material, registrations and randomness. The commitments are 128-bit
-// and fill the top of the range, so every fragment sits near 2^H - 1 and the
+// and fill the top of the range, so every stored fragment sits at 2^H and the
 // no-wrap ceiling is exercised where it binds -- a fragment above
 // [CircuitParams.MaxFragment] would make [Register] panic.
 //
-// No flooding is added: threshold decryption is out of scope here (a single
-// secret key stands in for the committee). The flooding only consumes budget,
-// deterministically, and TestFloodingBudget checks that budget.
+// The result is decrypted by the whole committee, flooding included, and
+// checked again under the whole key, which only the test holds.
 func TestWSSLE(t *testing.T) {
 	t.Run("5 parties", func(t *testing.T) {
 		params := SetupParams(8)
@@ -61,7 +60,7 @@ func TestWSSLE(t *testing.T) {
 // TestWSSLESweep runs the elections the benchmark times: every parameter set
 // at n = 2, 4, .., 2048 parties sharing the set's W equally, plus n = 1, a
 // single party holding the whole stake -- the one case where [EncodeMonomial]
-// wraps Y^W to -1. Each (set, n) runs sweepTrials elections, all in parallel
+// is asked for Y^W itself, which is Z. Each (set, n) runs sweepTrials elections, all in parallel
 // within a set; each is checked exactly as in TestWSSLE, and logs the rotation
 // Z^c the winner's fragments came back with, so the wraparound is on record.
 func TestWSSLESweep(t *testing.T) {
