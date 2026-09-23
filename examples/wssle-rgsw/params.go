@@ -108,11 +108,10 @@ const (
 
 // ParamSet is one row of the paper's parameter table.
 type ParamSet struct {
-	Name        string
-	LogN        int
-	LogQ, LogP  []int // bit sizes of the Q and P primes; d = ceil(len(LogQ)/len(LogP))
-	LogDelta    int
-	TotalWeight uint64 // W
+	Name       string
+	LogN       int
+	LogQ, LogP []int // bit sizes of the Q and P primes; d = ceil(len(LogQ)/len(LogP))
+	LogDelta   int
 	// A commitment is split into Fragments (the paper's C) fragments of
 	// FragmentBits (its H) bits each. With S = N/(C*W), Y = X^S and
 	// Z = Y^W = X^(N/C), slot j is Y^j and carries its k-th fragment at
@@ -142,19 +141,19 @@ var (
 	ParamSetA = ParamSet{
 		Name: "A", LogN: 14,
 		LogQ: []int{40, 40, 39, 39, 39, 39}, LogP: []int{60, 60, 60}, // 236 + 180, d = 2
-		LogDelta: 106, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
+		LogDelta: 106, Fragments: 1, FragmentBits: 128,
 		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 19,
 	}
 	ParamSetB = ParamSet{
 		Name: "B", LogN: 13,
 		LogQ: []int{20, 20, 20, 20, 20, 20, 20, 19}, LogP: []int{26, 25}, // 159 + 51, d = 4
-		LogDelta: 93, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
+		LogDelta: 93, Fragments: 2, FragmentBits: 64,
 		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 18,
 	}
 	ParamSetC = ParamSet{
 		Name: "C", LogN: 13,
 		LogQ: []int{33, 33, 33, 33}, LogP: []int{39, 38}, // 132 + 77, d = 2
-		LogDelta: 97, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
+		LogDelta: 97, Fragments: 4, FragmentBits: 32,
 		CommitteeSize: 32, StatSecurity: 64, LogErrorBound: 17,
 	}
 
@@ -165,29 +164,42 @@ var (
 	ParamSetALow = ParamSet{
 		Name: "ALow", LogN: 14,
 		LogQ: []int{50, 50, 50, 50}, LogP: []int{54, 54, 54, 54}, // 200 + 216, d = 1
-		LogDelta: 70, TotalWeight: 1 << 14, Fragments: 1, FragmentBits: 128,
+		LogDelta: 70, Fragments: 1, FragmentBits: 128,
 		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 19,
 	}
 	ParamSetBLow = ParamSet{
 		Name: "BLow", LogN: 13,
 		LogQ: []int{33, 33, 33, 32}, LogP: []int{40, 39}, // 131 + 79, d = 2
-		LogDelta: 65, TotalWeight: 1 << 12, Fragments: 2, FragmentBits: 64,
+		LogDelta: 65, Fragments: 2, FragmentBits: 64,
 		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 17,
 	}
 	ParamSetCLow = ParamSet{
 		Name: "CLow", LogN: 13,
 		LogQ: []int{49, 49}, LogP: []int{56, 55}, // 98 + 111, d = 1
-		LogDelta: 63, TotalWeight: 1 << 11, Fragments: 4, FragmentBits: 32,
+		LogDelta: 63, Fragments: 4, FragmentBits: 32,
 		CommitteeSize: 32, StatSecurity: 40, LogErrorBound: 16,
 	}
 
 	ParamSets = []ParamSet{ParamSetA, ParamSetB, ParamSetC, ParamSetALow, ParamSetBLow, ParamSetCLow}
 )
 
-// Params builds the [CircuitParams] of the set.
+// MaxTotalWeight is the largest public total weight the set's layout admits,
+// W = N/C: the slots are S = N/(C*W) apart, so C*W has to divide N, and the
+// fragments of a slot sit N/C apart whatever W is.
+func (ps ParamSet) MaxTotalWeight() uint64 {
+	return uint64((1 << ps.LogN) / ps.Fragments)
+}
+
+// Params builds the [CircuitParams] of the set at its largest total weight.
+// The noise grows with W (theta carries C*W), so this is the set as it was
+// sized, and [ParamSet.ParamsFor] at any election size is inside it.
 func (ps ParamSet) Params() CircuitParams {
+	return ps.paramsAt(ps.MaxTotalWeight())
+}
+
+// paramsAt builds the [CircuitParams] of the set at a given total weight.
+func (ps ParamSet) paramsAt(W uint64) CircuitParams {
 	N := 1 << ps.LogN
-	W := ps.TotalWeight
 	C := ps.Fragments
 	if C < 1 || C&(C-1) != 0 {
 		panic("fragments per commitment must be a power of two")
@@ -228,14 +240,36 @@ func (ps ParamSet) Params() CircuitParams {
 	return cp
 }
 
+// weightPerParty is the average stake an experiment gives a party: an n-party
+// election runs at W = 32n, until that reaches the layout's ceiling. Party
+// weights are then drawn at random from [1, 50], so no party holds much more
+// than its share (see randomWeights).
+const weightPerParty = 32
+
+// TotalWeightFor is the public total weight of an n-party election,
+// W = min(32n, N/C), the ceiling being [ParamSet.MaxTotalWeight]. Both ends
+// are powers of two only if n is, which every election size the experiments
+// use is.
+func (ps ParamSet) TotalWeightFor(n int) uint64 {
+	if w := uint64(weightPerParty * n); w < ps.MaxTotalWeight() {
+		return w
+	}
+	return ps.MaxTotalWeight()
+}
+
+// ParamsFor is [ParamSet.Params] at the total weight of an n-party election.
+// A smaller W only ever helps the noise -- theta carries C*W -- so a set sized
+// at its ceiling holds at every n.
+func (ps ParamSet) ParamsFor(n int) CircuitParams {
+	return ps.paramsAt(ps.TotalWeightFor(n))
+}
+
 // SetupParams builds [CircuitParams] on set C's ring, modulus and fragment
 // layout for an election of any other public total weight, which must be a
 // power of two with N/W at least set C's four fragments. The step tests use it
 // with small W.
 func SetupParams(totalWeight uint64) CircuitParams {
-	c := ParamSetC
-	c.TotalWeight = totalWeight
-	return c.Params()
+	return ParamSetC.paramsAt(totalWeight)
 }
 
 // CircuitParams holds the ring parameters and packing layout for the circuit.

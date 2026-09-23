@@ -18,7 +18,9 @@ const (
 // commitment exactly against an independent prediction.
 //
 // Each parameter set runs electionTrials elections, every one with fresh keys,
-// weight material, registrations and randomness. The commitments are 128-bit
+// weight material, registrations and randomness. The n parties split the
+// election's total weight W = min(32n, N/C) at random, each holding between 1
+// and maxPartyWeight ([randomWeights]). The commitments are 128-bit
 // and fill the top of the range, so every stored fragment sits at 2^H and the
 // no-wrap ceiling is exercised where it binds -- a fragment above
 // [CircuitParams.MaxFragment] would make [Register] panic.
@@ -40,7 +42,7 @@ func TestWSSLE(t *testing.T) {
 	}
 	for _, ps := range ParamSets {
 		t.Run(ps.Name, func(t *testing.T) {
-			params := ps.Params()
+			params := ps.ParamsFor(electionParties)
 			// Stored fragments, h_k + 1, reach 2^H.
 			if top := new(big.Int).Lsh(big.NewInt(1), ps.FragmentBits); top.Cmp(params.MaxFragment()) > 0 {
 				t.Fatalf("set %s cannot carry %d-bit fragments: MaxFragment has %d bits",
@@ -48,9 +50,11 @@ func TestWSSLE(t *testing.T) {
 			}
 			for trial := range electionTrials {
 				// Sets run one after another; a set's trials run in parallel.
+				key := ps.Name + "/trial" + strconv.Itoa(trial)
 				t.Run("trial"+strconv.Itoa(trial), func(t *testing.T) {
 					t.Parallel()
-					testWSSLE(t, params, topParties(electionParties, params.CommitmentBits(), ps.TotalWeight))
+					testWSSLE(t, params, randomParties(partyRNG(key), electionParties,
+						params.CommitmentBits(), params.TotalWt))
 				})
 			}
 		})
@@ -58,11 +62,11 @@ func TestWSSLE(t *testing.T) {
 }
 
 // TestWSSLESweep runs the elections the benchmark times: every parameter set
-// at n = 2, 4, .., 2048 parties sharing the set's W equally, plus n = 1, a
-// single party holding the whole stake -- the one case where [EncodeMonomial]
-// is asked for Y^W itself, which is Z. Each (set, n) runs sweepTrials elections, all in parallel
-// within a set; each is checked exactly as in TestWSSLE, and logs the rotation
-// Z^c the winner's fragments came back with, so the wraparound is on record.
+// at n = 16, 32, .., 2048 parties, splitting the election's total weight
+// W = min(32n, N/C) at random over [1, maxPartyWeight]. Each (set, n) runs
+// sweepTrials elections, all in parallel within a set; each is checked exactly
+// as in TestWSSLE, and logs the rotation Z^c the winner's fragments came back
+// with, so the wraparound is on record.
 func TestWSSLESweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("full elections over the whole benchmark grid; skipped in -short mode")
@@ -70,13 +74,15 @@ func TestWSSLESweep(t *testing.T) {
 	const sweepTrials = 3
 	for _, ps := range ParamSets {
 		t.Run(ps.Name, func(t *testing.T) {
-			params := ps.Params()
-			for n := 1; n <= 2048; n *= 2 {
+			for n := 16; n <= 2048; n *= 2 {
+				params := ps.ParamsFor(n)
 				for trial := range sweepTrials {
 					name := strconv.Itoa(n) + "_parties/trial" + strconv.Itoa(trial)
+					key := ps.Name + "/" + name
 					t.Run(name, func(t *testing.T) {
 						t.Parallel()
-						testWSSLE(t, params, topParties(n, params.CommitmentBits(), ps.TotalWeight))
+						testWSSLE(t, params, randomParties(partyRNG(key), n,
+							params.CommitmentBits(), params.TotalWt))
 					})
 				}
 			}
@@ -229,14 +235,4 @@ func topParties(n int, bits uint, totalWeight uint64) []Party {
 // topCommitment is 2^bits - 1, the largest bits-wide commitment.
 func topCommitment(bits uint) *big.Int {
 	return new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), bits), big.NewInt(1))
-}
-
-// uniformParties builds n weight-1 parties with distinct 32-bit commitments,
-// so the total weight is n and every party owns exactly one slot.
-func uniformParties(n int) []Party {
-	parties := make([]Party, n)
-	for i := range parties {
-		parties[i] = Party{Weight: 1, Commitment: big.NewInt(int64(0xFFFFFFFF - i))}
-	}
-	return parties
 }

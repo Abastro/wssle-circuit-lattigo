@@ -13,19 +13,21 @@ import (
 )
 
 // BenchmarkWSSLE measures one party's latency across election sizes of
-// 2, 4, 8, .., 2048 parties for each parameter set, the sweep Relect reports.
+// 16, 32, .., 2048 parties for each parameter set, the sweep Relect reports.
 //
-// The total weight is the parameter set's W, not n: each of the n parties
-// holds W/n, so the packing, the trace depth and the modulus are those of the
-// set, and only the party count varies.
+// The total weight of an n-party election is W = min(32n, N/C)
+// ([ParamSet.TotalWeightFor]), split at random over [1, maxPartyWeight]. The
+// ring, the trace depth and the modulus are the set's whatever n is; W enters
+// only through the slot spacing, and the cost of a phase does not depend on
+// it.
 //
-// Register is per-party work that each party runs on its own machine, so from
-// any one party's point of view the latency is a single Register, not n of
-// them: the other n-1 registrations are prepared once outside the timer, as are
-// the weight ciphertexts, which are public parameters reused across elections.
-// The aggregator-side pipeline (Aggregate over all n registrations, Elect) is
-// work a party waits on but does not perform, and is reported as separate
-// per-phase metrics. Threshold decryption is the key committee's, independent
+// What is measured is the aggregator-side pipeline, Aggregate over all n
+// registrations and then Elect: work a party waits on but does not perform,
+// reported as separate per-phase metrics. Registration is each party's own work
+// on its own machine, one Register per party whatever n is, and has its own
+// [BenchmarkRegister]; the n registrations and the weight ciphertexts, which
+// are public parameters reused across elections, are prepared outside the
+// timer. Threshold decryption is the key committee's, independent
 // of n and of the circuit, and has its own [BenchmarkThresholdDecrypt]. Key
 // generation runs once up front, standing in for a ThFHE.Setup that a real
 // deployment reuses across elections.
@@ -35,8 +37,8 @@ import (
 // benchmark function twice, a b.N = 1 calibration run and then the requested
 // count, and at n = 2048 the setup costs minutes.
 //
-// Commitments are the 32-bit values of [uniformParties] for every set; the
-// commitment value does not affect the cost of any phase.
+// Commitments are benchCommitmentBits wide for every set; the commitment value
+// does not affect the cost of any phase.
 //
 // Before the first measurement the process warms up for benchWarmUp, untimed:
 // until khugepaged has collapsed the heap into transparent huge pages, about
@@ -48,8 +50,8 @@ func BenchmarkWSSLE(b *testing.B) {
 
 	for _, ps := range ParamSets {
 		b.Run(ps.Name, func(b *testing.B) {
-			params := ps.Params()
-			for n := 2; n <= 2048; n *= 2 {
+			for n := 16; n <= 2048; n *= 2 {
+				params := ps.ParamsFor(n)
 				b.Run(strconv.Itoa(n)+"_parties", func(b *testing.B) {
 					benchmarkWSSLE(b, ps.Name, params, n)
 				})
@@ -62,14 +64,21 @@ func BenchmarkWSSLE(b *testing.B) {
 // with margin.
 const benchWarmUp = 15 * time.Second
 
+// warmUpParties is the election size [warmUp] runs, the smallest benchmarked.
+const warmUpParties = 16
+
+// benchCommitmentBits is the commitment width the benchmark registers, the
+// same for every set: the cost of a phase does not depend on it.
+const benchCommitmentBits = 32
+
 var warmUpOnce sync.Once
 
-// warmUp runs set A's election at n = 2 until benchWarmUp has passed, so the
+// warmUp runs set A's smallest election until benchWarmUp has passed, so the
 // heap the measurements use has been collapsed into huge pages. Set A is the
 // set with the largest polynomials, and the one the slow start was seen on.
 func warmUp() {
-	params := ParamSetA.Params()
-	st := setupFor(ParamSetA.Name, params, 2)
+	params := ParamSetA.ParamsFor(warmUpParties)
+	st := setupFor(ParamSetA.Name, params, warmUpParties)
 	for start := time.Now(); time.Since(start) < benchWarmUp; {
 		st.regs[0] = Register(st.enc, params, st.parties[0])
 		Elect(st.eval, params, Aggregate(st.eval, params, st.weights, st.regs))
@@ -99,10 +108,8 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 	}
 	benchCache.key, benchCache.setup = "", nil // release the previous one first
 
-	parties := uniformParties(n)
-	for i := range parties {
-		parties[i].Weight = params.TotalWt / uint64(n)
-	}
+	// The same weights the sweep checks this (set, n) with.
+	parties := randomParties(partyRNG(key), n, benchCommitmentBits, params.TotalWt)
 	_, pk, evk := SetupKeys(params)
 
 	enc := rgsw.NewEncryptor(params.RLWE, pk)
@@ -117,9 +124,10 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 		weights: EncryptWeights(enc, params, parties),
 		regs:    make([]*Registration, n),
 	}
-	// The other n-1 parties register on their own machines; only party 0's
-	// single Register is on the measured latency path.
-	for j := 1; j < n; j++ {
+	// Registration is each party's own work on its own machine, measured by
+	// [BenchmarkRegister]; here it is setup, so all n of them run outside the
+	// timer.
+	for j := range parties {
 		st.regs[j] = Register(enc, params, parties[j])
 	}
 
@@ -129,17 +137,13 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 
 func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
 	st := setupFor(name, params, n)
-	enc, eval, weights, regs, parties := st.enc, st.eval, st.weights, st.regs, st.parties
+	eval, weights, regs := st.eval, st.weights, st.regs
 
-	var registerTime, aggregateTime, electTime time.Duration
+	var aggregateTime, electTime time.Duration
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
-		regs[0] = Register(enc, params, parties[0])
-		registerTime += time.Since(start)
-
-		start = time.Now()
 		agg := Aggregate(eval, params, weights, regs)
 		aggregateTime += time.Since(start)
 
@@ -148,9 +152,39 @@ func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
 		electTime += time.Since(start)
 	}
 
-	b.ReportMetric(float64(registerTime.Nanoseconds())/float64(b.N), "ns/register")
 	b.ReportMetric(float64(aggregateTime.Nanoseconds())/float64(b.N), "ns/aggregate")
 	b.ReportMetric(float64(electTime.Nanoseconds())/float64(b.N), "ns/elect")
+}
+
+// BenchmarkRegister measures one party's Register, the only phase a party runs
+// itself. Nothing about the election enters it: not the party count, not the
+// total weight, not the weight the party holds -- only the ring and the
+// commitment width, so it is measured once per parameter set.
+//
+// It is measured on its own because it is short, tens of milliseconds against
+// the aggregator's seconds. [BenchmarkWSSLE] runs one election per measurement,
+// so a Register inside it is timed a handful of times on a heap that may still
+// be cold (benchmarks/16); Go's own b.N loop runs it hundreds of times per
+// measurement instead, after the same warm-up.
+func BenchmarkRegister(b *testing.B) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	warmUpOnce.Do(warmUp)
+
+	for _, ps := range ParamSets {
+		params := ps.Params()
+		_, pk, _ := SetupKeys(params)
+		enc := rgsw.NewEncryptor(params.RLWE, pk)
+		party := Party{
+			Weight:     weightPerParty,
+			Commitment: topCommitment(benchCommitmentBits),
+		}
+
+		b.Run(ps.Name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				Register(enc, params, party)
+			}
+		})
+	}
 }
 
 // BenchmarkThresholdDecrypt measures the key committee's decryption, which is
