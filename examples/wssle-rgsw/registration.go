@@ -27,9 +27,9 @@ type Party struct {
 // Note the commitment is encrypted as Delta*(h_0 + h_1 X + ... ), its fragments
 // as a polynomial of degree below C, not as the weight-dependent encoding
 // h*(Y^w - 1)/(Y - 1) of Fig. 1 line 5. The encoding
-// is applied by the aggregator instead, from the public [Weight.CtEcd] (see
-// [encodeH]), so a party cannot register a commitment spread over a weight
-// other than its own.
+// is applied by the aggregator instead, from the encoder it derives from the
+// public Enc(Y^w) (see [deriveEncoder] and [encodeH]), so a party cannot
+// register a commitment spread over a weight other than its own.
 type Registration struct {
 	CtH *rlwe.Ciphertext
 	CtR *rgsw.Ciphertext

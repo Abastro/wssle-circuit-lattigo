@@ -24,14 +24,19 @@ func TestRegister(t *testing.T) {
 	weight := EncryptWeight(enc, params, p.Weight)
 	reg := Register(enc, params, p)
 
-	assertOneHot(t, "ctW", decryptRGSW(enc, dec, eval, params, weight.CtW), params.Stride*int(p.Weight), 1)
+	assertOneHot(t, "ctW", decryptRGSW(enc, dec, eval, params, weight), params.Stride*int(p.Weight), 1)
 
-	// ctEcd holds 2*(1 + Y + ... + Y^(w-1)), derived from ctW by public arithmetic.
+	// The encoder [Aggregate] derives from ctW holds 2*(1 + Y + ... + Y^(w-1)),
+	// by public arithmetic alone.
+	ringQP := params.RLWE.RingQP().AtLevel(weight.LevelQ(), weight.LevelP())
+	ctW := rgsw.NewCiphertext(params.RLWE, weight.LevelQ(), weight.LevelP(), 0)
+	deriveEncoder(params, thetaQP(params, ringQP), weight, ctW)
+
 	wantEcd := make([]float64, params.RLWE.N())
 	for k := uint64(0); k < p.Weight; k++ {
 		wantEcd[params.Stride*int(k)] = 2
 	}
-	assertVec(t, "ctEcd", decryptRGSW(enc, dec, eval, params, weight.CtEcd), wantEcd)
+	assertVec(t, "ctEcd", decryptRGSW(enc, dec, eval, params, ctW), wantEcd)
 
 	// The registered commitment is h(Z), its fragments offset by one at
 	// X^(k*N/C); the spread over the weight comes later.
@@ -43,9 +48,9 @@ func TestRegister(t *testing.T) {
 
 	// Applying ctEcd reproduces Fig. 1 line 5's ct_H, doubled: h(Z) in each of
 	// the party's slots Y^j.
-	ctEcd := rlwe.NewCiphertext(params.RLWE, 1, reg.CtH.Level())
-	encodeH(eval, weight, reg, ctEcd)
-	assertVec(t, "encodeH", DecodeCoeffs(params.RLWE, dec.DecryptNew(ctEcd), params.EncodedScale()), refHVec(params, p))
+	ctH := rlwe.NewCiphertext(params.RLWE, 1, reg.CtH.Level())
+	encodeH(eval, ctW, reg, ctH)
+	assertVec(t, "encodeH", DecodeCoeffs(params.RLWE, dec.DecryptNew(ctH), params.EncodedScale()), refHVec(params, p))
 
 	nonzero, val := findNonzero(t, decryptRGSW(enc, dec, eval, params, reg.CtR))
 	if math.Abs(val-1) > 1e-6 {
@@ -86,7 +91,7 @@ func TestAggregate(t *testing.T) {
 	weights := EncryptWeights(enc, params, parties)
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
-	agg := Aggregate(eval, weights, regs)
+	agg := Aggregate(eval, params, weights, regs)
 	want := refAggregate(params.RLWE.N(), params.Stride, leaves)
 
 	// 2*Delta, since Aggregate now folds in the 2/(Y-1) of deriveEncoder.

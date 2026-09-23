@@ -94,7 +94,7 @@ func testWSSLE(t *testing.T, params CircuitParams, parties []Party) {
 	weights := EncryptWeights(enc, params, parties)
 	regs, leaves := registerAll(t, enc, dec, eval, params, parties)
 
-	agg := Aggregate(eval, weights, regs)
+	agg := Aggregate(eval, params, weights, regs)
 	ctOut := Elect(eval, params, agg)
 
 	winner, rotation := predictWinner(params, parties, leaves)

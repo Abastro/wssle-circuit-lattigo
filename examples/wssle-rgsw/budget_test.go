@@ -109,10 +109,15 @@ func measureSigmaZero(t *testing.T, params CircuitParams) float64 {
 		ct := Identity(enc.Encryptor, params)
 
 		mono := ct.CopyNew()
-		eval.ExternalProduct(mono, weight.CtW, mono)
+		eval.ExternalProduct(mono, weight, mono)
+
+		// The encoder as [Aggregate] derives it, RGSW(2*(Y - 1)/(Y - 1)) = 2.
+		ringQP := params.RLWE.RingQP().AtLevel(weight.LevelQ(), weight.LevelP())
+		ctEcd := rgsw.NewCiphertext(params.RLWE, weight.LevelQ(), weight.LevelP(), 0)
+		deriveEncoder(params, thetaQP(params, ringQP), weight, ctEcd)
 
 		deriv := ct.CopyNew()
-		eval.ExternalProduct(deriv, weight.CtEcd, deriv)
+		eval.ExternalProduct(deriv, ctEcd, deriv)
 
 		return sq(noise(ct, params.Scale())),
 			sq(noise(mono, params.Scale())),

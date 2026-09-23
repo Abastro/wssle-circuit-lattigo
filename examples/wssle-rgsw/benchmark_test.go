@@ -72,7 +72,7 @@ func warmUp() {
 	st := setupFor(ParamSetA.Name, params, 2)
 	for start := time.Now(); time.Since(start) < benchWarmUp; {
 		st.regs[0] = Register(st.enc, params, st.parties[0])
-		Elect(st.eval, params, Aggregate(st.eval, st.weights, st.regs))
+		Elect(st.eval, params, Aggregate(st.eval, params, st.weights, st.regs))
 	}
 }
 
@@ -81,7 +81,7 @@ type benchSetup struct {
 	parties []Party
 	enc     *rgsw.Encryptor
 	eval    *rgsw.Evaluator
-	weights []*Weight
+	weights []*rgsw.Ciphertext
 	regs    []*Registration
 }
 
@@ -111,7 +111,9 @@ func setupFor(name string, params CircuitParams, n int) *benchSetup {
 		enc:     enc,
 		eval:    rgsw.NewEvaluator(params.RLWE, evk),
 		// Stake is a public parameter, encrypted once per weight update rather
-		// than per election, so it sits outside the measured path.
+		// than per election, so its encryption sits outside the measured path.
+		// Deriving the encoder from it does not: that belongs to the encoding
+		// of a commitment, and [Aggregate] does it per election.
 		weights: EncryptWeights(enc, params, parties),
 		regs:    make([]*Registration, n),
 	}
@@ -138,7 +140,7 @@ func benchmarkWSSLE(b *testing.B, name string, params CircuitParams, n int) {
 		registerTime += time.Since(start)
 
 		start = time.Now()
-		agg := Aggregate(eval, weights, regs)
+		agg := Aggregate(eval, params, weights, regs)
 		aggregateTime += time.Since(start)
 
 		start = time.Now()
