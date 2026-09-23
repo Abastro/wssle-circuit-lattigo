@@ -71,14 +71,13 @@ func ShareSecretKey(params CircuitParams, sk *rlwe.SecretKey) []*KeyShare {
 // coefficients, in [0, Q).
 type DecryptionShare []*big.Int
 
-// PartialDecrypt is ThFHE.PartDec: the C fragment coefficients of c1 * sk_j, each
-// flooded by a uniform on [-F, F], F = [CircuitParams.FloodBound].
+// PartialDecrypt is ThFHE.PartDec: the C fragment coefficients of c1 * sk_j,
+// each flooded by a Gaussian of standard deviation
+// [CircuitParams.FloodSigma].
 //
-// With F = 2^s * B, this hides an evaluation error of magnitude at most B to
-// statistical distance at most B/F = 2^-s per coefficient, by the smudging lemma
-// (Asharov, Jain, Wichs, eprint 2011/613, Lemma 2.1). And uniform rather than
-// Gaussian: bounded support gives the flooding a hard bound, so it can never
-// fail decryption.
+// With sigma_flood = 2^(s-1) * B, this hides an evaluation error of magnitude
+// at most B to statistical distance about 0.80 * 2^-s per coefficient: a
+// Gaussian shifted by B is at distance B/(sigma*sqrt(2pi)) from itself.
 func PartialDecrypt(params CircuitParams, ct *rlwe.Ciphertext, share *KeyShare) DecryptionShare {
 	ringQ := params.RLWE.RingQ().AtLevel(ct.Level())
 
@@ -87,10 +86,10 @@ func PartialDecrypt(params CircuitParams, ct *rlwe.Ciphertext, share *KeyShare) 
 	ringQ.INTT(p, p)
 
 	Q := ringQ.Modulus()
-	F := params.FloodBound()
+	sigma := params.FloodSigma()
 	out := extractCoeffs(ringQ, p, fragmentIndices(params))
 	for _, v := range out {
-		v.Add(v, uniformIn(F))
+		v.Add(v, gaussianFlood(sigma))
 		v.Mod(v, Q)
 	}
 	return out
@@ -184,13 +183,34 @@ func extractCoeffs(ringQ *ring.Ring, p ring.Poly, indices []int) []*big.Int {
 	return out
 }
 
-// uniformIn samples an integer uniformly from [-F, F].
-func uniformIn(F *big.Int) *big.Int {
-	width := new(big.Int).Lsh(F, 1)
-	width.Add(width, big.NewInt(1))
-	u, err := rand.Int(rand.Reader, width)
-	if err != nil {
-		panic(err)
+// gaussianFlood samples one coefficient's flooding noise: an integer of
+// standard deviation sigma, as the Irwin-Hall sum of irwinHallTerms uniforms on
+// [0, sigma), recentred. Twelve uniforms have variance 12 * (sigma^2-1)/12, and
+// a density within a percent of the Gaussian's through the bulk -- which is all
+// the smudging bound reads: it is the density at the centre that sets the
+// distance a shift by B leaves, 0.396/sigma here against the Gaussian's
+// 0.399/sigma.
+//
+// Summing big.Int uniforms rather than scaling a float64 normal is not
+// fastidiousness: sigma is around 2^80 here and a float64 carries 53 bits, so a
+// scaled sample would land on a lattice of spacing about 2^27 and leave the
+// evaluation error's low bits in the clear -- exactly what the flooding is for.
+//
+// The support is bounded, |e| <= (irwinHallTerms/2)*sigma, so the flooding
+// cannot by itself carry a coefficient past the S/2 the rounding tolerates: at
+// every parameter set even m times that bound stays below it, well inside the
+// tail [CircuitParams.FloodingFits] budgets for.
+func gaussianFlood(sigma *big.Int) *big.Int {
+	sum := new(big.Int)
+	for range irwinHallTerms {
+		u, err := rand.Int(rand.Reader, sigma)
+		if err != nil {
+			panic(err)
+		}
+		sum.Add(sum, u)
 	}
-	return u.Sub(u, F)
+	return sum.Sub(sum, new(big.Int).Mul(big.NewInt(irwinHallTerms/2), sigma))
 }
+
+// irwinHallTerms is how many uniforms [gaussianFlood] sums, and must be even.
+const irwinHallTerms = 12

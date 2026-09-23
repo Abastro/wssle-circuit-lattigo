@@ -158,7 +158,8 @@ func TestTrace(t *testing.T) {
 // TestThresholdDecrypt checks the committee's decryption against decryption
 // under the whole key, which no one holds in an election and the test does:
 // the combined phase must be the true phase plus the committee's flooding,
-// that flooding within its hard bound m*F, and actually applied at scale F.
+// that flooding within the hard bound the sampler's support gives it, and
+// actually applied at the scale sigma_flood.
 func TestThresholdDecrypt(t *testing.T) {
 	params := SetupParams(8)
 	sk, pk, _ := SetupKeys(params)
@@ -195,25 +196,26 @@ func TestThresholdDecrypt(t *testing.T) {
 	}
 
 	truth := centeredCoeffs(params.RLWE, rlwe.NewDecryptor(params.RLWE, sk).DecryptNew(ct))
-	F := params.FloodBound()
-	bound := new(big.Int).Mul(F, big.NewInt(int64(params.CommitteeSize)))
+	sigma := params.FloodSigma()
+	// [gaussianFlood]'s support is (irwinHallTerms/2)*sigma per member.
+	bound := new(big.Int).Mul(sigma, big.NewInt(int64(params.CommitteeSize)*irwinHallTerms/2))
 	largest := new(big.Int)
 	for k, ph := range phases {
 		flood := new(big.Int).Sub(ph, truth[params.FragmentIndex(k)])
 		if new(big.Int).Abs(flood).Cmp(bound) > 0 {
-			t.Errorf("coeff %d: flooding 2^%.2f exceeds its bound m*F = 2^%.2f", k, log2Abs(flood), log2Abs(bound))
+			t.Errorf("coeff %d: flooding 2^%.2f exceeds its support bound 2^%.2f", k, log2Abs(flood), log2Abs(bound))
 		}
 		if new(big.Int).Abs(flood).Cmp(largest) > 0 {
 			largest.Abs(flood)
 		}
 	}
-	// A sum of m uniforms on [-F, F] has standard deviation F*sqrt(m/3); all
-	// C of them below F/4 would mean the flooding is not being applied.
-	if largest.Cmp(new(big.Int).Rsh(F, 2)) < 0 {
-		t.Errorf("flooding too small: largest 2^%.2f, F = 2^%.2f", log2Abs(largest), log2Abs(F))
+	// The committee's flooding has standard deviation sigma*sqrt(m); all C of
+	// them below sigma/4 would mean it is not being applied.
+	if largest.Cmp(new(big.Int).Rsh(sigma, 2)) < 0 {
+		t.Errorf("flooding too small: largest 2^%.2f, sigma_flood = 2^%.2f", log2Abs(largest), log2Abs(sigma))
 	}
-	t.Logf("flooding: largest 2^%.2f, F = 2^%d, bound m*F = 2^%.2f",
-		log2Abs(largest), params.LogErrorBound+params.SmudgeBits(), log2Abs(bound))
+	t.Logf("flooding: largest 2^%.2f, sigma_flood = 2^%d, support bound 2^%.2f",
+		log2Abs(largest), params.LogErrorBound+params.SmudgeBits()-1, log2Abs(bound))
 }
 
 // registerAll registers every party and, by decrypting each ct_R, recovers
