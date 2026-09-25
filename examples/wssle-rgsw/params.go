@@ -21,7 +21,6 @@
 package wsslergsw
 
 import (
-	"math"
 	"math/big"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -321,66 +320,32 @@ func (p CircuitParams) ResultScale() *big.Int {
 	return p.EncodedScale()
 }
 
-// SmudgeBits is s, the statistical distance 2^-s the flooding leaves at each
-// decrypted coefficient, the set's [ParamSet.StatSecurity].
+// SmudgeBits is s, the ratio 2^s of the flooding range to the error bound B:
+// the flooding hides each decrypted coefficient's evaluation error to
+// statistical distance about 2^-s (the smudging lemma), so s is the set's
+// [ParamSet.StatSecurity].
 func (p CircuitParams) SmudgeBits() int {
 	return p.StatSecurity
 }
 
-// FloodSigma is sigma_flood = 2^(s-1) * B, the standard deviation each member
-// floods each coefficient of its share with ([gaussianFlood]).
-//
-// Shifting a Gaussian of standard deviation sigma by at most B leaves
-// statistical distance about B/(sigma*sqrt(2pi)), so this sigma hides an
-// evaluation error of magnitude B to 2/sqrt(2pi) * 2^-s = 0.80 * 2^-s per
-// coefficient, inside the 2^-s asked for. Gaussian rather than uniform because
-// the m members' floods then add in variance: the committee costs
-// sqrt(m)*sigma rather than m*F, half a bit per doubling of m instead of one.
-func (p CircuitParams) FloodSigma() *big.Int {
-	return new(big.Int).Lsh(big.NewInt(1), uint(p.LogErrorBound+p.SmudgeBits()-1))
-}
-
-// FloodTailFactor is ceil(beta*sqrt(m)), the multiple of sigma_flood the whole
-// committee's flooding stays within except with probability 2^-failureBits:
-// the m floods sum to standard deviation sqrt(m)*sigma_flood, and beta is the
-// tail of [betaForFailure] over the C decrypted coefficients.
-func (p CircuitParams) FloodTailFactor() int64 {
-	return int64(math.Ceil(betaForFailure(p.Fragments) * math.Sqrt(float64(p.CommitteeSize))))
+// FloodBound is F = 2^s * B: each member floods each coefficient of its share
+// with a uniform on [-F, F].
+func (p CircuitParams) FloodBound() *big.Int {
+	return new(big.Int).Lsh(big.NewInt(1), uint(p.LogErrorBound+p.SmudgeBits()))
 }
 
 // FloodingFits reports whether the whole committee's flooding, together with
 // the evaluation error, stays below the S/2 that rounding tolerates:
 //
-//	ceil(beta*sqrt(m)) * sigma_flood + B <= S/2.
+//	m*F + B <= S/2.
 //
-// Neither side of the failure budget is spent twice: the evaluation error
-// exceeds B with probability 2^-failureBits, and the flooding exceeds its own
-// term with the same probability, so a set passing this check fails decryption
-// with probability at most 2^(1-failureBits). In practice the flooding term is
-// far from binding -- every set has bits of headroom, and [gaussianFlood]'s
-// support is bounded by 6*sigma_flood per member anyway -- so the failure
-// probability is the evaluation error's alone.
+// The left side is a hard bound -- uniforms have bounded support -- except for
+// B itself, which the evaluation error exceeds with probability 2^-64. So a
+// set passing this check fails decryption only in that event.
 func (p CircuitParams) FloodingFits() bool {
-	lhs := new(big.Int).Mul(p.FloodSigma(), big.NewInt(p.FloodTailFactor()))
+	lhs := new(big.Int).Mul(p.FloodBound(), big.NewInt(int64(p.CommitteeSize)))
 	lhs.Add(lhs, new(big.Int).Lsh(big.NewInt(1), uint(p.LogErrorBound)))
 	return lhs.Cmp(new(big.Int).Rsh(p.ResultScale(), 1)) <= 0
-}
-
-// betaForFailure returns the beta with n*erfc(beta/sqrt2) = 2^-failureBits,
-// the tail parameter of prop:err-dec in references/error-analysis. The union
-// bound runs over the C coefficients the committee decrypts.
-func betaForFailure(n int) float64 {
-	target := math.Exp2(-failureBits)
-	lo, hi := 1.0, 30.0
-	for range 200 {
-		mid := (lo + hi) / 2
-		if float64(n)*math.Erfc(mid/math.Sqrt2) > target {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	return (lo + hi) / 2
 }
 
 // MaxFragment is the largest stored fragment, h_k + 1 ([EncodeCommitment]),

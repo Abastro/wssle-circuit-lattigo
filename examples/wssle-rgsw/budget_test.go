@@ -9,6 +9,23 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
+// betaForFailure returns the beta with n*erfc(beta/sqrt2) = 2^-failureBits,
+// the tail parameter of prop:err-dec in references/error-analysis. The union
+// bound runs over the C coefficients the committee decrypts.
+func betaForFailure(n int) float64 {
+	target := math.Exp2(-failureBits)
+	lo, hi := 1.0, 30.0
+	for i := 0; i < 200; i++ {
+		mid := (lo + hi) / 2
+		if float64(n)*math.Erfc(mid/math.Sqrt2) > target {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return (lo + hi) / 2
+}
+
 // TestFloodingBudget checks each parameter set's threshold decryption against
 // the noise it has to carry:
 //
@@ -38,14 +55,13 @@ func checkBudget(t *testing.T, ps ParamSet) {
 		t.Errorf("set %s: beta*sigma_0 = 2^%.2f exceeds the stored bound 2^%d", ps.Name, derived, ps.LogErrorBound)
 	}
 
-	// Flooding: m Gaussians of standard deviation sigma_flood, to their
-	// ceil(beta*sqrt(m)) tail, plus B, against S/2.
+	// Flooding: m uniforms on [-F, F] plus B, against S/2.
 	m := params.CommitteeSize
-	lhs := new(big.Int).Mul(params.FloodSigma(), big.NewInt(params.FloodTailFactor()))
+	lhs := new(big.Int).Mul(params.FloodBound(), big.NewInt(int64(m)))
 	lhs.Add(lhs, new(big.Int).Lsh(big.NewInt(1), uint(ps.LogErrorBound)))
 	half := new(big.Int).Rsh(params.ResultScale(), 1)
-	t.Logf("m = %d, s = %d, sigma_flood = 2^%d: ceil(beta*sqrt(m))*sigma_flood + B = 2^%.2f (factor %d) against S/2 = 2^%.0f, headroom %+.2f bits",
-		m, params.SmudgeBits(), ps.LogErrorBound+params.SmudgeBits()-1, bitsOf(lhs), params.FloodTailFactor(), bitsOf(half), bitsOf(half)-bitsOf(lhs))
+	t.Logf("m = %d, s = %d, F = 2^%d: m*F + B = 2^%.2f against S/2 = 2^%.0f, headroom %+.2f bits",
+		m, params.SmudgeBits(), ps.LogErrorBound+params.SmudgeBits(), bitsOf(lhs), bitsOf(half), bitsOf(half)-bitsOf(lhs))
 	if !params.FloodingFits() {
 		t.Errorf("set %s: the committee's flooding does not fit below S/2", ps.Name)
 	}
