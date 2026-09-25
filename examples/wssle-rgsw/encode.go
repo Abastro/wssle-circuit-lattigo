@@ -93,13 +93,15 @@ func JoinFragments(params CircuitParams, frags []*big.Int) *big.Int {
 	return h
 }
 
-// EncodeMonomial builds the plaintext Y^exp = X^{Stride*exp}, for any
-// 0 <= exp <= W. It carries no scaling factor: the monomials of this circuit
-// are all RGSW operands.
+// EncodeMonomial builds the plaintext Y^exp = X^{Stride*exp}, for any exp in
+// [0, 2*C*W), the order of Y. It carries no scaling factor: the monomials of
+// this circuit are all RGSW operands.
 //
-// exp == W is the one case that wraps: Y^W = X^N = -1, which lands on the
-// constant coefficient with a sign flip rather than off the end of the ring.
-// That is a party holding the entire stake, which [Register] must not reject.
+// Exponents from C*W up wrap with a sign flip: Y^(C*W) = X^N = -1, so
+// Y^(C*W+j) = -Y^j lands on coefficient Stride*j negated. Stride*exp stays
+// below 2N over the whole range, so one subtraction reaches the ring.
+// [EncryptWeight] uses exp <= W only -- exp == W, the whole stake, being its
+// one wrapping case -- while [Register] samples over the whole order.
 func EncodeMonomial(params CircuitParams, exp uint64) *rlwe.Plaintext {
 	pt := rlwe.NewPlaintext(params.RLWE, params.RLWE.MaxLevelQ())
 

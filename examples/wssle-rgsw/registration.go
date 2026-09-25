@@ -37,7 +37,7 @@ type Registration struct {
 
 // Register runs the Registration phase for a single party: RLWE-encrypts the
 // commitment and RGSW-encrypts a fresh randomness monomial Y^r for r sampled
-// uniformly from Z_W.
+// uniformly from Z_{2CW}, the whole order of Y.
 //
 // It rejects a commitment wider than C*H bits, and one whose stored fragment,
 // offset by one ([EncodeCommitment]), exceeds [CircuitParams.MaxFragment]: the
@@ -51,8 +51,16 @@ func Register(enc *rgsw.Encryptor, params CircuitParams, p Party) *Registration 
 		}
 	}
 
-	// W is a power of two, so this reduction is unbiased.
-	r := sampling.RandUint64() % params.TotalWt
+	// r covers the whole order of Y, 2*C*W, not just the W weight slots.
+	// Y^(C*W) = X^N = -1, so the rotation group is Z_{2CW}, and decoding
+	// publishes which of its 2C blocks the total rotation r = sum_i r_i landed
+	// in -- that is what the sign pattern of the output is ([DecodeFragments]).
+	// Drawn from Z_W, an honest r_i would sit in a single window of length W,
+	// leaving the published block index to say which side of a coalition-chosen
+	// boundary the elected slot fell on; over the whole order that index is
+	// uniform on Z_{2C} and independent of the elected slot. 2*C*W is
+	// a power of two, so the reduction is unbiased.
+	r := sampling.RandUint64() % (2 * uint64(params.Fragments) * params.TotalWt)
 
 	ctH, err := enc.EncryptNew(EncodeCommitment(params, p.Commitment))
 	if err != nil {

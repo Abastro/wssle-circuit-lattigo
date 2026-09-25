@@ -52,15 +52,14 @@ func TestRegister(t *testing.T) {
 	encodeH(eval, ctW, reg, ctH)
 	assertVec(t, "encodeH", DecodeCoeffs(params.RLWE, dec.DecryptNew(ctH), params.EncodedScale()), refHVec(params, p))
 
+	// r ranges over the whole order of Y, 2*C*W, so every stride position is
+	// legal and the top half of the range arrives negated: Y^(C*W+j) = -Y^j.
 	nonzero, val := findNonzero(t, decryptRGSW(enc, dec, eval, params, reg.CtR))
-	if math.Abs(val-1) > 1e-6 {
-		t.Errorf("ctR: coeff[%d] = %v, want 1", nonzero, val)
+	if math.Abs(math.Abs(val)-1) > 1e-6 {
+		t.Errorf("ctR: coeff[%d] = %v, want +/-1", nonzero, val)
 	}
 	if nonzero%params.Stride != 0 {
 		t.Errorf("ctR: nonzero coeff at %d not aligned to stride %d", nonzero, params.Stride)
-	}
-	if nonzero/params.Stride >= int(params.TotalWt) {
-		t.Errorf("ctR: sampled r=%d out of range [0, totalWeight)", nonzero/params.Stride)
 	}
 }
 
@@ -230,10 +229,16 @@ func registerAll(t *testing.T, enc *rgsw.Encryptor, dec *rlwe.Decryptor, eval *r
 		regs[i] = Register(enc, params, p)
 
 		idx, val := findNonzero(t, decryptRGSW(enc, dec, eval, params, regs[i].CtR))
-		if math.Abs(val-1) > 1e-6 || idx%stride != 0 {
+		if math.Abs(math.Abs(val)-1) > 1e-6 || idx%stride != 0 {
 			t.Fatalf("party %d: unexpected ctR encoding at %d = %v", i, idx, val)
 		}
-		leaves[i] = refNode{w: p.Weight, r: uint64(idx / stride), h: refHVec(params, p)}
+		// r lives in Z_{2CW}, whose top half arrives negated as
+		// Y^(C*W+j) = -Y^j, so a -1 at X^(S*j) is r = C*W + j.
+		r := uint64(idx / stride)
+		if val < 0 {
+			r += uint64(params.Fragments) * params.TotalWt
+		}
+		leaves[i] = refNode{w: p.Weight, r: r, h: refHVec(params, p)}
 	}
 	return regs, leaves
 }
